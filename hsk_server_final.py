@@ -12,33 +12,28 @@ import psycopg2 # Thư viện PostgreSQL
 
 # --- CẤU HÌNH DATABASE ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
-if not DATABASE_URL:
-    print("CẢNH BÁO: KHÔNG TÌM THẤY DATABASE_URL. Dữ liệu sẽ không được lưu.")
-    DB = None
-else:
+DB_STATUS = "Postgres" if DATABASE_URL else None
+
+if DB_STATUS:
     try:
-        # Connect to PostgreSQL and initialize table
-        CONN = psycopg2.connect(DATABASE_URL, sslmode='require')
-        CURSOR = CONN.cursor()
-        
-        # Tạo bảng nếu chưa tồn tại
-        CURSOR.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id VARCHAR(50) PRIMARY KEY,
-                state JSONB,
-                last_study_time INTEGER
-            );
-        """)
-        CONN.commit()
-        DB = "Postgres" # Dùng chuỗi đánh dấu đã kết nối
+        # CHỈ CẦN THỬ KẾT NỐI VÀ TẠO BẢNG Ở LẦN KHỞI ĐỘNG ĐẦU TIÊN
+        # Các hàm handler sẽ tự tạo kết nối riêng (Thread-Safe)
+        with psycopg2.connect(DATABASE_URL, sslmode='require') as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id VARCHAR(50) PRIMARY KEY,
+                        state JSONB,
+                        last_study_time INTEGER
+                    );
+                """)
+            conn.commit()
         print("--> Kết nối PostgreSQL thành công và khởi tạo bảng.")
-        
     except Exception as e:
         print(f"--> LỖI KẾT NỐI POSTGRESQL: {e}. Dữ liệu sẽ không được lưu.")
-        DB = None 
+        DB_STATUS = None 
 
 # --- FACEBOOK CONFIGURATION (MANDATORY) ---
-# ĐÃ CẬP NHẬT TOKEN MỚI TỪ USER
 PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQKWd5qB15zFMy2KdPm6Ko1rJX6R4ZC3EtnNfvf0gT76V1Qk4l1vflxL1pDVwY8mrgbgAaFFtG6bzcrhJfQ86HdK5v8qZA9zTIge2ZBJcx9oNPOjk1DlQ8juGinZBuah0RDgbCd2vBvlNWr47GVz70BdPNzKRctCGphNJRI0Wm57UwKRmXOZAVfDP7zwZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat" 
 WORDS_PER_SESSION = 10 
@@ -67,13 +62,13 @@ BOT_MODES = [
 
 app = FastAPI()
 
-# --- DATABASE HANDLERS (POSTGRESQL) ---
+# --- DATABASE HANDLERS (POSTGRESQL - THREAD-SAFE) ---
 
 def get_user_state(user_id: str) -> Dict[str, Any]:
     """Retrieves user state from PostgreSQL, or returns a default state."""
     default_state = {
         "session_hanzi": [], 
-        "learned_hanzi": [], # DANH SÁCH HÁN TỰ ĐÃ HỌC/KIỂM TRA
+        "learned_hanzi": [], 
         "mode_index": 0, 
         "task_queue": [], 
         "backup_queue": [],
@@ -82,47 +77,51 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
         "score": 0, "total_questions": 0,
         "last_study_time": 0, 
         "reminder_sent": False,
-        "current_phase": "IDLE", # IDLE, PREVIEW, READY_TO_QUIZ, QUIZ
-        "preview_queue": [], # Danh sách Hán tự để học
+        "current_phase": "IDLE", 
+        "preview_queue": [], 
     }
-    if DB:
+    if DB_STATUS:
         try:
-            CURSOR.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
-            result = CURSOR.fetchone()
-            if result:
-                loaded_state = result[0]
-                # FIX KeyError: Merging loaded state with default state to ensure all keys exist
-                final_state = {**default_state, **loaded_state}
-                return final_state
-            else:
-                # Insert default state if user not found
-                save_user_state(user_id, default_state, update_time=False)
-                return default_state
+            with psycopg2.connect(DATABASE_URL, sslmode='require') as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
+                    result = cursor.fetchone()
+                    if result:
+                        loaded_state = result[0]
+                        # FIX KeyError: Merging loaded state with default state to ensure all keys exist
+                        final_state = {**default_state, **loaded_state}
+                        return final_state
+                    else:
+                        # Insert default state if user not found
+                        save_user_state(user_id, default_state, update_time=False)
+                        return default_state
         except Exception as e:
             print(f"LỖI POSTGRESQL KHI ĐỌC: {e}. Sử dụng trạng thái mặc định.")
+            # Quan trọng: Nếu DB lỗi, phải trả về default_state để Bot không crash
             return default_state
     return default_state
 
 def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = True):
     """Saves user state to PostgreSQL."""
-    if DB:
+    if DB_STATUS:
         try:
-            if update_time:
-                state["last_study_time"] = time.time()
-                state["reminder_sent"] = False
-            
-            # Use ON CONFLICT to UPSERT (UPDATE if exists, INSERT if not exists)
-            CURSOR.execute("""
-                INSERT INTO users (user_id, state, last_study_time)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET state = EXCLUDED.state, last_study_time = EXCLUDED.last_study_time
-            """, (user_id, json.dumps(state), state.get("last_study_time", 0)))
-            CONN.commit()
+            with psycopg2.connect(DATABASE_URL, sslmode='require') as conn:
+                with conn.cursor() as cursor:
+                    if update_time:
+                        state["last_study_time"] = time.time()
+                        state["reminder_sent"] = False
+                    
+                    # Use ON CONFLICT to UPSERT (UPDATE if exists, INSERT if not exists)
+                    cursor.execute("""
+                        INSERT INTO users (user_id, state, last_study_time)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (user_id) DO UPDATE
+                        SET state = EXCLUDED.state, last_study_time = EXCLUDED.last_study_time
+                    """, (user_id, json.dumps(state), state.get("last_study_time", 0)))
+                conn.commit()
             
         except Exception as e:
             print(f"LỖI POSTGRESQL KHI GHI: {e}. Dữ liệu không được lưu.")
-            CONN.rollback()
             
 # --- BOT QUIZ LOGIC (FIXED) ---
 
@@ -191,7 +190,7 @@ def show_next_preview_word(user_id: str) -> str:
     state["current_task"] = {"hanzi": hanzi_to_show, "mode": "PREVIEW"}
     save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi xem từ
 
-    # THAY ĐỔI: Thêm Pinyin Ví dụ vào nội dung hiển thị
+    # Thêm chi tiết Pinyin Ví dụ vào nội dung hiển thị
     ví_dụ_pinyin = word.get('Ví dụ Pinyin', 'Không có Pinyin câu ví dụ.')
 
     return (
@@ -302,7 +301,9 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
         masked = word["Ví dụ"].replace(word["Hán tự"], "___")
         return f"({remaining} câu còn lại)\nViết Hán tự còn thiếu:\n{masked}\n({word['Dịch câu']})"
     elif mode == "translate_sentence":
-        return f"({remaining} câu còn lại)\nDịch câu sau sang Hán tự:\n🇻🇳 {word['Dịch câu']}\n(Gợi ý: {word['Ví dụ Pinyin']})" # HIỂN THỊ PINYIN CÂU VÍ DỤ
+        # HIỂN THỊ PINYIN CÂU VÍ DỤ
+        ví_dụ_pinyin = word.get('Ví dụ Pinyin', 'N/A')
+        return f"({remaining} câu còn lại)\nDịch câu sau sang Hán tự:\n🇻🇳 {word['Dịch câu']}\n(Gợi ý: {ví_dụ_pinyin})"
     
     return "Lỗi nạp câu hỏi."
 
@@ -364,7 +365,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
             f"   Lệnh: `bắt đầu` / `start`\n"
             f"   -> Bắt đầu bài kiểm tra 4 Dạng bài với 10 từ bạn vừa học (Perfect Run).\n\n"
             f"3. ĐẶT LẠI TIẾN TRÌNH:\n"
-            f"   Lệnh: `reset` / `clear`\n"
+            f"   Lệnh: `reset` / `clear` / `xóa`\n"
             f"   -> Xóa toàn bộ danh sách từ đã học và bắt đầu vòng học mới từ đầu (tất cả {len(ALL_HANZI)} từ).\n\n"
             f"4. LỆNH TRONG KHI HỌC:\n"
             f"   - Gõ: `tiếp tục` / `continue` (Trong PREVIEW: Xem từ tiếp theo. Trong QUIZ: Bắt đầu Dạng bài mới).\n"
@@ -433,41 +434,43 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
 
 def check_and_send_reminders_async():
     """Background task to check all users and send reminders after 1 hour."""
-    if not DB:
+    if not DB_STATUS:
         print("Cannot check reminders: DB connection error.")
         return
     
     try:
-        # Lấy tất cả người dùng từ DB
-        CURSOR.execute("SELECT user_id, state, last_study_time FROM users WHERE last_study_time > 0")
-        docs = CURSOR.fetchall()
-        current_time = time.time()
-        
-        for user_id, state, last_study_time in docs:
-            
-            # Check if 1 hour passed and reminder hasn't been sent
-            if (current_time - last_study_time) > REMINDER_INTERVAL_SECONDS and not state.get('reminder_sent', False):
+        with psycopg2.connect(DATABASE_URL, sslmode='require') as conn:
+            with conn.cursor() as cursor:
+                # Lấy tất cả người dùng từ DB
+                cursor.execute("SELECT user_id, state, last_study_time FROM users WHERE last_study_time > 0")
+                docs = cursor.fetchall()
+                current_time = time.time()
                 
-                # --- THAY ĐỔI: GỌI HÀM HỌC ĐỂ CHỌN 10 TỪ MỚI CHO USER ---
-                # 1. Khởi tạo 10 từ mới cho người dùng
-                # Lưu ý: Hàm này sẽ tự động update time và reset reminder_sent = False
-                reply_message = start_learning_phase(user_id) 
+                for user_id, state, last_study_time in docs:
+                    
+                    # Check if 1 hour passed and reminder hasn't been sent
+                    if (current_time - last_study_time) > REMINDER_INTERVAL_SECONDS and not state.get('reminder_sent', False):
+                        
+                        # --- THAY ĐỔI: GỌI HÀM HỌC ĐỂ CHỌN 10 TỪ MỚI CHO USER ---
+                        # 1. Khởi tạo 10 từ mới cho người dùng
+                        # Lưu ý: Hàm này sẽ tự động update time và reset reminder_sent = False
+                        reply_message = start_learning_phase(user_id) 
 
-                # 2. Gửi tin nhắn nhắc nhở và thông báo bắt đầu học
-                reminder_message = (
-                    "🔔 Đã 1 tiếng rồi! Đã đến lúc học tiếp!\n\n"
-                    "Tôi đã chọn 10 từ mới (khác hoàn toàn từ cũ) cho bạn.\n"
-                ) + reply_message
-                
-                send_facebook_message(user_id, reminder_message)
-                
-                # 3. Cập nhật cờ nhắc nhở trong DB (KHÔNG CẦN VÌ start_learning_phase đã làm)
-                # Tuy nhiên, ta cần set lại reminder_sent = True để không gửi lại ngay
-                state = get_user_state(user_id)
-                state['reminder_sent'] = True
-                save_user_state(user_id, state, update_time=False) # update_time=False: CHỈ CẬP NHẬT FLAG
-                
-                print(f"--> Sent reminder and started new session for user: {user_id}")
+                        # 2. Gửi tin nhắn nhắc nhở và thông báo bắt đầu học
+                        reminder_message = (
+                            "🔔 Đã 1 tiếng rồi! Đã đến lúc học tiếp!\n\n"
+                            "Tôi đã chọn 10 từ mới (khác hoàn toàn từ cũ) cho bạn.\n"
+                        ) + reply_message
+                        
+                        send_facebook_message(user_id, reminder_message)
+                        
+                        # 3. Cập nhật cờ nhắc nhở trong DB (KHÔNG CẦN VÌ start_learning_phase đã làm)
+                        # Tuy nhiên, ta cần set lại reminder_sent = True để không gửi lại ngay
+                        state = get_user_state(user_id)
+                        state['reminder_sent'] = True
+                        save_user_state(user_id, state, update_time=False) # update_time=False: CHỈ CẬP NHẬT FLAG
+                        
+                        print(f"--> Sent reminder and started new session for user: {user_id}")
                 
     except Exception as e:
         print(f"LỖI POSTGRESQL KHI KIỂM TRA NHẮC NHỞ: {e}")
