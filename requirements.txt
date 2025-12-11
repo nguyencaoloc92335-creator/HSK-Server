@@ -2,5 +2,5 @@ fastapi
 uvicorn 
 requests
 firebase_admin
-psycopg2
+psycopg2-binary
 google-generativeai
