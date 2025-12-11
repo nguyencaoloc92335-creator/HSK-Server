@@ -13,9 +13,7 @@ import time
 
 # --- CẤU HÌNH FIREBASE ---
 try:
-    # SỬ DỤNG TÊN FILE CHÌA KHÓA ĐÃ ĐƯỢC XÁC NHẬN
-    # LƯU Ý: LỖI INVALID JWT SIGNATURE CHO THẤY CHÌA KHÓA NÀY ĐÃ HẾT HẠN. 
-    # BẠN PHẢI TẢI XUỐNG MỘT FILE firebase_admin.json MỚI HOÀN TOÀN TỪ FIREBASE.
+    # LƯU Ý: Nếu lỗi Invalid JWT Signature, BẠN PHẢI TẢI XUỐNG FILE firebase_admin.json MỚI
     CRED = credentials.Certificate("firebase_admin.json")
     initialize_app(CRED)
     DB = firestore.client()
@@ -66,22 +64,29 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
         "last_study_time": 0, "reminder_sent": False
     }
     if DB:
-        doc_ref = DB.collection('users').document(user_id)
-        doc = doc_ref.get()
-        if doc.exists:
-            return doc.to_dict()
-        doc_ref.set(default_state)
-        return default_state
+        try:
+            doc_ref = DB.collection('users').document(user_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                return doc.to_dict()
+            doc_ref.set(default_state)
+            return default_state
+        except Exception as e:
+            print(f"LỖI FIRESTORE KHI ĐỌC: {e}. Sử dụng trạng thái mặc định.")
+            return default_state
     return default_state
 
 def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = True):
     """Saves user state to Firestore."""
     if DB:
-        if update_time:
-            state["last_study_time"] = time.time()
-            state["reminder_sent"] = False # Reset reminder flag on user interaction
-        DB.collection('users').document(user_id).set(state)
-
+        try:
+            if update_time:
+                state["last_study_time"] = time.time()
+                state["reminder_sent"] = False # Reset reminder flag on user interaction
+            DB.collection('users').document(user_id).set(state)
+        except Exception as e:
+            print(f"LỖI FIRESTORE KHI GHI: {e}. Dữ liệu không được lưu.")
+            
 # --- BOT QUIZ LOGIC (Full State Management) ---
 
 def start_new_session_bot(user_id: str) -> str:
