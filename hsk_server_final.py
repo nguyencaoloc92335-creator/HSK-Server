@@ -49,10 +49,12 @@ try:
     HSK_DATA: List[Dict[str, Any]] = hsk_data.HSK_DATA
     # Tạo bản đồ từ Hán tự -> từ vựng để tra cứu nhanh
     HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
+    ALL_HANZI = list(HSK_MAP.keys()) # Danh sách tất cả Hán tự
     print(f"--> Successfully loaded {len(HSK_DATA)} vocabulary items.")
 except ImportError:
     HSK_DATA = [{"Hán tự": "你好", "Pinyin": "nǐhǎo", "Nghĩa": "xin chào", "Ví dụ": "你好吗", "Dịch câu": "Bạn khỏe không"}]
     HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
+    ALL_HANZI = list(HSK_MAP.keys())
 
 # Define Quiz Modes (Matching PC App logic)
 BOT_MODES = [
@@ -70,13 +72,17 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
     """Retrieves user state from PostgreSQL, or returns a default state."""
     default_state = {
         "session_hanzi": [], 
+        "learned_hanzi": [], # DANH SÁCH HÁN TỰ ĐÃ HỌC/KIỂM TRA
         "mode_index": 0, 
         "task_queue": [], 
         "backup_queue": [],
         "mistake_made": False, 
         "current_task": None, 
         "score": 0, "total_questions": 0,
-        "last_study_time": 0, "reminder_sent": False
+        "last_study_time": 0, 
+        "reminder_sent": False,
+        "current_phase": "IDLE", # IDLE, PREVIEW, READY_TO_QUIZ, QUIZ
+        "preview_queue": [], # Danh sách Hán tự để học
     }
     if DB:
         try:
@@ -100,7 +106,7 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
         try:
             if update_time:
                 state["last_study_time"] = time.time()
-                state["reminder_sent"] = False # <--- BỎ RESET FLAG NẾU KHÔNG CÓ TƯƠNG TÁC THỰC SỰ
+                state["reminder_sent"] = False
             
             # Use ON CONFLICT to UPSERT (UPDATE if exists, INSERT if not exists)
             CURSOR.execute("""
@@ -108,7 +114,7 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
                 VALUES (%s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE
                 SET state = EXCLUDED.state, last_study_time = EXCLUDED.last_study_time
-            """, (user_id, json.dumps(state), state.get("last_study_time", 0))) # SỬ DỤNG GET ĐỂ TRÁNH LỖI KEY ERROR NẾU KHÔNG UPDATE TIME
+            """, (user_id, json.dumps(state), state.get("last_study_time", 0)))
             CONN.commit()
             
         except Exception as e:
@@ -117,26 +123,105 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
             
 # --- BOT QUIZ LOGIC (FIXED) ---
 
-def start_new_session_bot(user_id: str) -> str:
+def start_learning_phase(user_id: str) -> str:
+    """[LỆNH: HỌC] Chọn 10 từ mới và bắt đầu giai đoạn Preview."""
     state = get_user_state(user_id)
-    session_words = random.sample(HSK_DATA, min(WORDS_PER_SESSION, len(HSK_DATA)))
     
-    state["session_hanzi"] = [word["Hán tự"] for word in session_words]
+    available_hanzi = [h for h in ALL_HANZI if h not in state["learned_hanzi"]]
+    
+    if len(available_hanzi) < WORDS_PER_SESSION:
+        # Nếu đã học gần hết hoặc hết từ, RESET danh sách đã học và bắt đầu vòng mới
+        state["learned_hanzi"] = []
+        available_hanzi = ALL_HANZI
+        
+        # Lấy từ vựng mới
+        session_hanzi = random.sample(available_hanzi, min(WORDS_PER_SESSION, len(available_hanzi)))
+        reset_message = "🔄 ĐÃ HOÀN TẤT VÒNG HỌC CŨ. BẮT ĐẦU VÒNG HỌC MỚI!\n"
+    else:
+        session_hanzi = random.sample(available_hanzi, WORDS_PER_SESSION)
+        reset_message = ""
+    
+    state["session_hanzi"] = session_hanzi
+    state["preview_queue"] = list(state["session_hanzi"])
+    
+    state.update({
+        "current_phase": "PREVIEW",
+        "mode_index": 0, 
+        "score": 0, 
+        "total_questions": 0
+    })
+    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi BẮT ĐẦU HỌC
+    
+    return reset_message + show_next_preview_word(user_id)
+
+def show_next_preview_word(user_id: str) -> str:
+    """Hiển thị từ tiếp theo trong hàng đợi Preview."""
+    state = get_user_state(user_id)
+    
+    if not state["preview_queue"]:
+        # Kết thúc giai đoạn Preview
+        state["current_phase"] = "READY_TO_QUIZ"
+        state["current_task"] = None
+        save_user_state(user_id, state, update_time=False)
+        return (
+            f"✅ HOÀN TẤT GIAI ĐOẠN HỌC!\n\n"
+            f"Bạn đã xem hết {WORDS_PER_SESSION} từ mới. "
+            f"Gõ `bắt đầu` để chuyển sang chế độ kiểm tra Perfect Run."
+        )
+
+    hanzi_to_show = state["preview_queue"].pop(0)
+    word = HSK_MAP.get(hanzi_to_show, HSK_DATA[0])
+    remaining = len(state["preview_queue"])
+    
+    # Cập nhật task (chỉ để lưu từ đang xem)
+    state["current_task"] = {"hanzi": hanzi_to_show, "mode": "PREVIEW"}
+    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi xem từ
+
+    return (
+        f"📖 TỪ MỚI ({WORDS_PER_SESSION - remaining}/{WORDS_PER_SESSION})\n"
+        f"🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n"
+        f"🇻🇳 Nghĩa: {word['Nghĩa']}\n"
+        f"Ví dụ: {word['Ví dụ']}\n"
+        f"Gõ `tiếp tục` để xem từ tiếp theo, hoặc gõ `bắt đầu` để vào bài kiểm tra."
+    )
+
+def start_quiz_phase(user_id: str) -> str:
+    """[LỆNH: BẮT ĐẦU] Bắt đầu giai đoạn Quizzing (Dạng 1)."""
+    state = get_user_state(user_id)
+    
+    state["current_phase"] = "QUIZ"
+    
+    # Reset quiz mode index and score for fresh start
     state.update({"mode_index": 0, "score": 0, "total_questions": 0})
-    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi BẮT ĐẦU
+    save_user_state(user_id, state, update_time=True)
     
     return load_next_mode_bot(user_id)
 
 def load_next_mode_bot(user_id: str) -> str:
+    """Nạp bài tập cho dạng tiếp theo hoặc kết thúc session (Chỉ chạy trong phase QUIZ)."""
     state = get_user_state(user_id)
     
+    if state["current_phase"] != "QUIZ":
+        return "Bot bị lỗi trạng thái. Gõ `học` để bắt đầu lại phiên mới."
+    
     if state["mode_index"] >= len(BOT_MODES):
+        # KẾT THÚC VÀ LƯU TỪ VỰNG ĐÃ HỌC/KIỂM TRA
+        state["current_phase"] = "IDLE"
         state["task_queue"] = []; state["current_task"] = None
-        save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi KẾT THÚC
-        return "🎉 CHÚC MỪNG! Bạn đã hoàn thành xuất sắc phiên học này!\n\nGõ 'học' để bắt đầu phiên mới."
+        
+        # Thêm các từ đã học trong session này vào danh sách đã học
+        state["learned_hanzi"].extend(state["session_hanzi"]) 
+        
+        save_user_state(user_id, state, update_time=True) 
+        
+        return (
+            f"🎉 CHÚC MỪNG! Bạn đã hoàn thành TẤT CẢ các Dạng bài!\n"
+            f"Tiến độ đã được lưu lại. Gõ `học` để bắt đầu phiên mới với 10 từ khác."
+        )
 
     current_mode = BOT_MODES[state["mode_index"]]
     
+    # Thiết lập Task Queue (chỉ lưu Hán tự và mode_name)
     state["task_queue"] = []
     for hanzi in state["session_hanzi"]:
         state["task_queue"].append({"hanzi": hanzi, "mode_name": current_mode["name"]})
@@ -145,30 +230,36 @@ def load_next_mode_bot(user_id: str) -> str:
     state["backup_queue"] = list(state["task_queue"])
     state["mistake_made"] = False
     
-    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi CHUYỂN DẠNG
+    save_user_state(user_id, state, update_time=True) 
 
     return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id, is_new_mode=True)
 
 def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
+    """Lấy câu hỏi tiếp theo và kiểm tra luật Perfect Run."""
     state = get_user_state(user_id)
 
+    # 1. Kiểm tra luật Perfect Run (Khi hết Task Queue)
     if not state["task_queue"]:
         if state["mistake_made"]:
+            # Sai -> Trộn lại và làm lại mode này
             state["task_queue"] = list(state["backup_queue"])
             random.shuffle(state["task_queue"])
             state["mistake_made"] = False
-            save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi LÀM LẠI
+            save_user_state(user_id, state, update_time=True)
             return "❌ BẠN ĐÃ SAI!\nLàm lại Dạng này cho đến khi đúng hết 100% nhé.\n\n" + get_next_question(user_id)
         else:
+            # Đúng 100% -> Tăng Mode Index và YÊU CẦU xác nhận chuyển Mode
             state["mode_index"] += 1
-            state["current_task"] = None 
-            save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi HOÀN THÀNH
-
+            state["current_task"] = None # Rất quan trọng để Bot dừng lại
+            save_user_state(user_id, state, update_time=True)
+            
+            # Gửi thông báo hoàn thành và yêu cầu xác nhận tiếp tục
             if state["mode_index"] >= len(BOT_MODES):
-                return load_next_mode_bot(user_id) 
+                return load_next_mode_bot(user_id) # Kết thúc (Hàm này sẽ trả về thông báo kết thúc)
             else:
                 return f"✅ HOÀN THÀNH DẠNG BÀI {state['mode_index']}/{len(BOT_MODES)}!\n\nGõ `tiếp tục` để bắt đầu Dạng bài mới nhé."
             
+    # 2. Lấy task tiếp theo
     task = state["task_queue"].pop(0)
     state["current_task"] = task
     
@@ -177,11 +268,13 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
     
     save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi GỬI CÂU HỎI MỚI
     
+    # Tra cứu thông tin từ vựng đầy đủ từ Hán tự
     hanzi = task["hanzi"]
-    word = HSK_MAP.get(hanzi, HSK_DATA[0])
+    word = HSK_MAP.get(hanzi, HSK_DATA[0]) 
     mode = task["mode_name"]
     remaining = len(state['task_queue']) + 1
     
+    # Generate question text
     if mode == "hanzi_to_viet":
         return f"({remaining} câu còn lại)\nTừ này nghĩa là gì?\n🇨🇳 {word['Hán tự']} ({word['Pinyin']})"
     elif mode == "viet_to_hanzi":
@@ -195,14 +288,20 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
     return "Lỗi nạp câu hỏi."
 
 def check_answer_bot(user_id: str, answer: str) -> str:
+    """Checks the user's answer and saves state."""
     state = get_user_state(user_id)
+    if state["current_phase"] != "QUIZ":
+        return "Gõ `bắt đầu` để chuyển sang chế độ kiểm tra sau khi học xong."
+        
     if not state or not state["current_task"]: return "Xin lỗi, hình như chưa có câu hỏi nào. Gõ 'học' để bắt đầu nhé!"
 
+    # Tra cứu từ vựng đầy đủ từ Hán tự
     hanzi = state["current_task"]["hanzi"]
     word = HSK_MAP.get(hanzi, HSK_DATA[0])
     mode = state["current_task"]["mode_name"]
     is_correct = False
     
+    # Scoring Logic
     if mode == "hanzi_to_viet":
         keywords = word["Nghĩa"].lower().split(',')
         is_correct = any(k.strip() in answer.lower() for k in keywords) or (answer.lower() in word["Nghĩa"].lower())
@@ -211,6 +310,7 @@ def check_answer_bot(user_id: str, answer: str) -> str:
     elif mode == "translate_sentence":
         is_correct = (answer == word["Ví dụ"] or word["Hán tự"] in answer)
         
+    # Response Generation
     if is_correct:
         state["score"] += 1
         feedback = "✅ CHÍNH XÁC!"
@@ -222,56 +322,77 @@ def check_answer_bot(user_id: str, answer: str) -> str:
     return feedback + "\n\n" + get_next_question(user_id)
 
 def process_chat_logic(user_id: str, user_text: str) -> str:
+    """Main Chatbot logic handler."""
     user_text = user_text.lower().strip()
     state = get_user_state(user_id)
     
-    # Hướng dẫn (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME)
+    # --- 1. Xử lý lệnh HƯỚNG DẪN / MENU ---
     if user_text in ["hướng dẫn", "help", "menu"]:
         return (
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
-            f"1. Bắt đầu phiên học:\n"
-            f"   Gõ: `học` hoặc `bắt đầu`\n"
-            f"2. Tiếp tục Dạng bài:\n"
-            f"   Gõ: `tiếp tục`\n"
-            f"3. Các lệnh trong khi học:\n"
-            f"   - Gõ: `bỏ qua` hoặc `dap an`: Xem đáp án và chuyển sang câu mới.\n"
-            f"   - Gõ: `điểm` hoặc `score`: Xem thống kê kết quả hiện tại.\n"
+            f"1. GIAI ĐOẠN HỌC (PREVIEW):\n"
+            f"   Lệnh: `học`\n"
+            f"   -> Chọn 10 từ ngẫu nhiên và hiển thị đầy đủ thông tin để bạn học. Các từ này chưa từng được học trước đó.\n\n"
+            f"2. GIAI ĐOẠN KIỂM TRA (QUIZ):\n"
+            f"   Lệnh: `bắt đầu`\n"
+            f"   -> Bắt đầu bài kiểm tra 4 Dạng bài với 10 từ bạn vừa học.\n\n"
+            f"3. LỆNH TRONG KHI HỌC:\n"
+            f"   - Gõ: `tiếp tục` (Trong PREVIEW: Xem từ tiếp theo. Trong QUIZ: Bắt đầu Dạng bài mới).\n"
+            f"   - Gõ: `bỏ qua` / `dap an`: Xem đáp án câu hiện tại (chỉ dùng trong QUIZ).\n"
+            f"   - Gõ: `điểm`: Xem thống kê kết quả hiện tại.\n"
         )
+    
+    # --- 2. Xử lý lệnh BẮT ĐẦU HỌC (PREVIEW) ---
+    if user_text in ["học"]: 
+        return start_learning_phase(user_id)
 
-    # 1. Xử lý lệnh TIẾP TỤC (Chuyển mode) - CÓ CẬP NHẬT THỜI GIAN
+    # --- 3. Xử lý lệnh BẮT ĐẦU KIỂM TRA (QUIZ) ---
+    if user_text in ["bắt đầu"]: 
+        if state["current_phase"] == "QUIZ":
+            return "Bạn đang trong bài kiểm tra rồi! Hãy trả lời câu hỏi hiện tại."
+        if not state["session_hanzi"]:
+            return "Bạn chưa chọn từ để học. Gõ `học` để bắt đầu phiên mới."
+        
+        return start_quiz_phase(user_id)
+
+    # --- 4. Xử lý lệnh TIẾP TỤC ---
     if user_text in ["tiếp tục"]:
-        if state["current_task"] is None and not state["task_queue"]:
+        if state["current_phase"] == "PREVIEW":
+            return show_next_preview_word(user_id)
+        
+        elif state["current_phase"] == "READY_TO_QUIZ":
+            return start_quiz_phase(user_id)
+            
+        elif state["current_phase"] == "QUIZ" and state["current_task"] is None:
+            # Tiếp tục khi hoàn thành 100% một Mode và Bot yêu cầu gõ tiếp tục
             return load_next_mode_bot(user_id)
+            
         else:
             return "Bạn đang học dở, hãy trả lời câu hỏi hiện tại trước."
-            
-    # 2. Trả lời câu hỏi (chạy trước để ưu tiên trả lời)
-    if state["current_task"] is not None:
+
+    # --- 5. Trả lời câu hỏi (Chỉ chấp nhận trong phase QUIZ) ---
+    if state["current_phase"] == "QUIZ" and state["current_task"] is not None:
         return check_answer_bot(user_id, user_text)
     
-    # 3. Logic bắt đầu (chỉ chạy khi không có câu hỏi nào đang chờ) - CÓ CẬP NHẬT THỜI GIAN
-    if user_text in ["học", "bắt đầu", "start"]: 
-        return start_new_session_bot(user_id)
-    
-    # 4. Lệnh khác
+    # --- 6. Xử lý lệnh BỎ QUA (Chỉ chấp nhận trong phase QUIZ) ---
     elif user_text in ["bỏ qua", "skip", "dap an"]:
-        # CÓ CẬP NHẬT THỜI GIAN
-        if state["current_task"] is not None:
+        if state["current_phase"] == "QUIZ" and state["current_task"] is not None:
             state["mistake_made"] = True
             hanzi = state["current_task"]["hanzi"]
             word = HSK_MAP.get(hanzi, HSK_DATA[0])
             next_question = get_next_question(user_id)
-            save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi BỎ QUA
+            save_user_state(user_id, state, update_time=True) 
             return (f"⏩ Bỏ qua\nĐáp án là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\n\n") + next_question
         else:
-            return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
+            return "Lệnh `bỏ qua` chỉ dùng trong bài kiểm tra. Gõ `học` để bắt đầu phiên mới."
             
-    # Lệnh tra cứu (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME)
+    # --- 7. Lệnh tra cứu (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME) ---
     elif user_text in ["điểm", "score"]: 
         return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
         
+    # --- 8. Mặc định/Trạng thái IDLE ---
     else: 
-        return "Chào bạn! Gõ 'học' để bắt đầu ôn tập nhanh.\n(Gõ 'điểm' hoặc 'hướng dẫn' để xem thêm)."
+        return "Chào bạn! Gõ `học` để bắt đầu ôn tập nhanh.\n(Gõ `hướng dẫn` để xem thêm các lệnh)."
 
 
 # --- REMINDER LOGIC ---
@@ -293,13 +414,26 @@ def check_and_send_reminders_async():
             # Check if 1 hour passed and reminder hasn't been sent
             if (current_time - last_study_time) > REMINDER_INTERVAL_SECONDS and not state.get('reminder_sent', False):
                 
-                reminder_message = "🔔 Đã 1 tiếng rồi! Bạn có muốn học tiếp không?\n\nGõ 'học' để tiếp tục phiên học HSK của bạn nhé!"
+                # --- THAY ĐỔI: GỌI HÀM HỌC ĐỂ CHỌN 10 TỪ MỚI CHO USER ---
+                # 1. Khởi tạo 10 từ mới cho người dùng
+                # Lưu ý: Hàm này sẽ tự động update time và reset reminder_sent = False
+                reply_message = start_learning_phase(user_id) 
+
+                # 2. Gửi tin nhắn nhắc nhở và thông báo bắt đầu học
+                reminder_message = (
+                    "🔔 Đã 1 tiếng rồi! Đã đến lúc học tiếp!\n\n"
+                    "Tôi đã chọn 10 từ mới (khác hoàn toàn từ cũ) cho bạn.\n"
+                ) + reply_message
+                
                 send_facebook_message(user_id, reminder_message)
                 
-                # Cập nhật cờ nhắc nhở trong DB
+                # 3. Cập nhật cờ nhắc nhở trong DB (KHÔNG CẦN VÌ start_learning_phase đã làm)
+                # Tuy nhiên, ta cần set lại reminder_sent = True để không gửi lại ngay
+                state = get_user_state(user_id)
                 state['reminder_sent'] = True
                 save_user_state(user_id, state, update_time=False) # update_time=False: CHỈ CẬP NHẬT FLAG
-                print(f"--> Sent reminder to user: {user_id}")
+                
+                print(f"--> Sent reminder and started new session for user: {user_id}")
                 
     except Exception as e:
         print(f"LỖI POSTGRESQL KHI KIỂM TRA NHẮC NHỞ: {e}")
