@@ -358,13 +358,18 @@ def finish_session(user_id, state):
 # --- 8. API ROUTE (FASTAPI) ---
 
 @app.get("/")
+def home():
+    """Trang chủ đơn giản để check server"""
+    return PlainTextResponse("HSK Server is running! Webhook endpoint is at /webhook")
+
+@app.get("/webhook")
 def verify_webhook(request: Request):
     """Xác thực Webhook với Facebook"""
     if request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(request.query_params.get("hub.challenge"))
     return PlainTextResponse("Error", status_code=403)
 
-@app.post("/")
+@app.post("/webhook")
 async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
     """
     Nhận tin nhắn từ Facebook.
