@@ -7,20 +7,35 @@ import random
 import requests
 import json
 from typing import List, Dict, Any, Optional
-import firebase_admin 
-from firebase_admin import credentials, firestore, initialize_app
 import time
+import psycopg2 # Thư viện PostgreSQL
 
-# --- CẤU HÌNH FIREBASE ---
-try:
-    # LƯU Ý: Nếu lỗi Invalid JWT Signature, BẠN PHẢI TẢI XUỐNG FILE firebase_admin.json MỚI
-    CRED = credentials.Certificate("firebase_admin.json")
-    initialize_app(CRED)
-    DB = firestore.client()
-    print("--> Firebase Firestore connection successful!")
-except Exception as e:
-    print(f"--> FIREBASE CONNECTION ERROR: {e}. Dữ liệu sẽ không được lưu.")
-    DB = None 
+# --- CẤU HÌNH DATABASE ---
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    print("CẢNH BÁO: KHÔNG TÌM THẤY DATABASE_URL. Dữ liệu sẽ không được lưu.")
+    DB = None
+else:
+    try:
+        # Connect to PostgreSQL and initialize table
+        CONN = psycopg2.connect(DATABASE_URL, sslmode='require')
+        CURSOR = CONN.cursor()
+        
+        # Tạo bảng nếu chưa tồn tại
+        CURSOR.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id VARCHAR(50) PRIMARY KEY,
+                state JSONB,
+                last_study_time INTEGER
+            );
+        """)
+        CONN.commit()
+        DB = "Postgres" # Dùng chuỗi đánh dấu đã kết nối
+        print("--> Kết nối PostgreSQL thành công và khởi tạo bảng.")
+        
+    except Exception as e:
+        print(f"--> LỖI KẾT NỐI POSTGRESQL: {e}. Dữ liệu sẽ không được lưu.")
+        DB = None 
 
 # --- FACEBOOK CONFIGURATION (MANDATORY) ---
 PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQCSLHPqo2Y2HfW8GvdyfPc6oOCqVb8X61h6HadIILwTn7uDkZAIqgdEKEDMDFmhNYfoPVSevT907qEpFE5OYZC9VtfEwyR1uZA3b49k5VlBVZAPpfmsFqURLl5Pn0P4LZAaxWMzhuHmEhJeZB6Gq1NXeZAxQ3dp940k3P2VMJmjorafaFWeiAvU7YtOZCgZDZD"
@@ -49,10 +64,10 @@ BOT_MODES = [
 
 app = FastAPI()
 
-# --- DATABASE HANDLERS ---
+# --- DATABASE HANDLERS (POSTGRESQL) ---
 
 def get_user_state(user_id: str) -> Dict[str, Any]:
-    """Retrieves user state from Firestore, or returns a default state."""
+    """Retrieves user state from PostgreSQL, or returns a default state."""
     default_state = {
         "session_hanzi": [], 
         "mode_index": 0, 
@@ -65,59 +80,63 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
     }
     if DB:
         try:
-            doc_ref = DB.collection('users').document(user_id)
-            doc = doc_ref.get()
-            if doc.exists:
-                return doc.to_dict()
-            doc_ref.set(default_state)
-            return default_state
+            CURSOR.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
+            result = CURSOR.fetchone()
+            if result:
+                # PostgreSQL JSONB column returns a Python dict
+                return result[0]
+            else:
+                # Insert default state if user not found
+                save_user_state(user_id, default_state, update_time=False)
+                return default_state
         except Exception as e:
-            print(f"LỖI FIRESTORE KHI ĐỌC: {e}. Sử dụng trạng thái mặc định.")
+            print(f"LỖI POSTGRESQL KHI ĐỌC: {e}. Sử dụng trạng thái mặc định.")
             return default_state
     return default_state
 
 def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = True):
-    """Saves user state to Firestore."""
+    """Saves user state to PostgreSQL."""
     if DB:
         try:
             if update_time:
                 state["last_study_time"] = time.time()
-                state["reminder_sent"] = False # Reset reminder flag on user interaction
-            DB.collection('users').document(user_id).set(state)
-        except Exception as e:
-            print(f"LỖI FIRESTORE KHI GHI: {e}. Dữ liệu không được lưu.")
+                state["reminder_sent"] = False
             
-# --- BOT QUIZ LOGIC (Full State Management) ---
+            # Use ON CONFLICT to UPSERT (UPDATE if exists, INSERT if not exists)
+            CURSOR.execute("""
+                INSERT INTO users (user_id, state, last_study_time)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET state = EXCLUDED.state, last_study_time = EXCLUDED.last_study_time
+            """, (user_id, json.dumps(state), state["last_study_time"]))
+            CONN.commit()
+            
+        except Exception as e:
+            print(f"LỖI POSTGRESQL KHI GHI: {e}. Dữ liệu không được lưu.")
+            CONN.rollback()
+            
+# --- BOT QUIZ LOGIC (FIXED) ---
 
 def start_new_session_bot(user_id: str) -> str:
-    """Initializes a new session and saves state to DB."""
     state = get_user_state(user_id)
     session_words = random.sample(HSK_DATA, min(WORDS_PER_SESSION, len(HSK_DATA)))
     
-    # LƯU TRỮ CHỈ HÁN TỰ (để database ổn định)
     state["session_hanzi"] = [word["Hán tự"] for word in session_words]
-    
-    state.update({
-        "mode_index": 0, "score": 0, "total_questions": 0
-    })
+    state.update({"mode_index": 0, "score": 0, "total_questions": 0})
     save_user_state(user_id, state)
     
-    # Khởi động Mode đầu tiên
     return load_next_mode_bot(user_id)
 
 def load_next_mode_bot(user_id: str) -> str:
-    """Loads the next quiz mode or concludes the session (Perfect Run logic)."""
     state = get_user_state(user_id)
     
     if state["mode_index"] >= len(BOT_MODES):
-        # Kết thúc session
         state["task_queue"] = []; state["current_task"] = None
         save_user_state(user_id, state)
         return "🎉 CHÚC MỪNG! Bạn đã hoàn thành xuất sắc phiên học này!\n\nGõ 'học' để bắt đầu phiên mới."
 
     current_mode = BOT_MODES[state["mode_index"]]
     
-    # Thiết lập Task Queue (chỉ lưu Hán tự và mode_name)
     state["task_queue"] = []
     for hanzi in state["session_hanzi"]:
         state["task_queue"].append({"hanzi": hanzi, "mode_name": current_mode["name"]})
@@ -128,51 +147,41 @@ def load_next_mode_bot(user_id: str) -> str:
     
     save_user_state(user_id, state)
     
-    # Trả về thông báo bắt đầu và câu hỏi đầu tiên
     return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id, is_new_mode=True)
 
 def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
-    """Retrieves the next question from the queue. FIX LỖI: Loại bỏ gọi đệ quy."""
     state = get_user_state(user_id)
 
-    # 1. Kiểm tra luật Perfect Run (Khi hết Task Queue)
     if not state["task_queue"]:
         if state["mistake_made"]:
-            # Sai -> Trộn lại và làm lại mode này
             state["task_queue"] = list(state["backup_queue"])
             random.shuffle(state["task_queue"])
             state["mistake_made"] = False
             save_user_state(user_id, state)
             return "❌ BẠN ĐÃ SAI!\nLàm lại Dạng này cho đến khi đúng hết 100% nhé.\n\n" + get_next_question(user_id)
         else:
-            # Đúng 100% -> Tăng Mode Index và YÊU CẦU xác nhận chuyển Mode
             state["mode_index"] += 1
-            state["current_task"] = None # Rất quan trọng để Bot dừng lại
+            state["current_task"] = None 
             save_user_state(user_id, state)
             
-            # Gửi thông báo hoàn thành và yêu cầu xác nhận tiếp tục
             if state["mode_index"] >= len(BOT_MODES):
-                return load_next_mode_bot(user_id) # Kết thúc
+                return load_next_mode_bot(user_id) 
             else:
                 return f"✅ HOÀN THÀNH DẠNG BÀI {state['mode_index']}/{len(BOT_MODES)}!\n\nGõ `tiếp tục` để bắt đầu Dạng bài mới nhé."
             
-    # 2. Lấy task tiếp theo
     task = state["task_queue"].pop(0)
     state["current_task"] = task
     
-    # Chỉ tăng total_questions khi không phải là lỗi đệ quy/lặp lại
     if not is_new_mode:
         state["total_questions"] += 1
     
     save_user_state(user_id, state)
     
-    # Tra cứu thông tin từ vựng đầy đủ từ Hán tự
     hanzi = task["hanzi"]
-    word = HSK_MAP.get(hanzi, HSK_DATA[0]) # Fallback nếu lỗi
+    word = HSK_MAP.get(hanzi, HSK_DATA[0])
     mode = task["mode_name"]
     remaining = len(state['task_queue']) + 1
     
-    # Generate question text
     if mode == "hanzi_to_viet":
         return f"({remaining} câu còn lại)\nTừ này nghĩa là gì?\n🇨🇳 {word['Hán tự']} ({word['Pinyin']})"
     elif mode == "viet_to_hanzi":
@@ -186,17 +195,14 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
     return "Lỗi nạp câu hỏi."
 
 def check_answer_bot(user_id: str, answer: str) -> str:
-    """Checks the user's answer and saves state."""
     state = get_user_state(user_id)
     if not state or not state["current_task"]: return "Xin lỗi, hình như chưa có câu hỏi nào. Gõ 'học' để bắt đầu nhé!"
 
-    # Tra cứu từ vựng đầy đủ từ Hán tự
     hanzi = state["current_task"]["hanzi"]
     word = HSK_MAP.get(hanzi, HSK_DATA[0])
     mode = state["current_task"]["mode_name"]
     is_correct = False
     
-    # Scoring Logic
     if mode == "hanzi_to_viet":
         keywords = word["Nghĩa"].lower().split(',')
         is_correct = any(k.strip() in answer.lower() for k in keywords) or (answer.lower() in word["Nghĩa"].lower())
@@ -205,7 +211,6 @@ def check_answer_bot(user_id: str, answer: str) -> str:
     elif mode == "translate_sentence":
         is_correct = (answer == word["Ví dụ"] or word["Hán tự"] in answer)
         
-    # Response Generation
     if is_correct:
         state["score"] += 1
         feedback = "✅ CHÍNH XÁC!"
@@ -214,62 +219,44 @@ def check_answer_bot(user_id: str, answer: str) -> str:
         feedback = (f"❌ SAI RỒI!\nĐáp án đúng là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\nCâu mẫu: {word['Ví dụ']}")
     
     save_user_state(user_id, state)
-    # Sau khi trả lời xong, lấy câu hỏi tiếp theo
     return feedback + "\n\n" + get_next_question(user_id)
 
 def process_chat_logic(user_id: str, user_text: str) -> str:
-    """Main Chatbot logic handler."""
     user_text = user_text.lower().strip()
     state = get_user_state(user_id)
     
-    # Hướng dẫn
     if user_text in ["hướng dẫn", "help", "menu"]:
         return (
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
             f"1. Bắt đầu phiên học:\n"
             f"   Gõ: `học` hoặc `bắt đầu`\n"
-            f"   -> Bot sẽ chọn ngẫu nhiên 10 từ và bắt đầu Dạng 1.\n\n"
             f"2. Tiếp tục Dạng bài:\n"
             f"   Gõ: `tiếp tục`\n"
-            f"   -> Dùng khi Bot yêu cầu xác nhận để chuyển sang Dạng bài mới.\n\n"
-            f"3. Chế độ học tập:\n"
-            f"   Bot sẽ đố bạn qua 4 Dạng bài liên tục, giống hệt App PC.\n"
-            f"   *Lưu ý: Bạn phải trả lời đúng 100% (Perfect Run) mới qua được Dạng tiếp theo!*\n\n"
-            f"4. Các lệnh trong khi học:\n"
+            f"3. Các lệnh trong khi học:\n"
             f"   - Gõ: `bỏ qua` hoặc `dap an`: Xem đáp án và chuyển sang câu mới.\n"
-            f"   - Gõ: `điểm` hoặc `score`: Xem thống kê kết quả hiện tại.\n\n"
-            f"5. Nhắc nhở:\n"
-            f"   - Bot sẽ tự động nhắn tin nhắc nhở bạn sau mỗi 1 tiếng nếu bạn không tương tác."
+            f"   - Gõ: `điểm` hoặc `score`: Xem thống kê kết quả hiện tại.\n"
         )
 
-    # 1. Xử lý lệnh TIẾP TỤC (Chuyển mode)
     if user_text in ["tiếp tục"]:
-        # Chỉ cho phép tiếp tục khi current_task rỗng VÀ task_queue rỗng (chờ chuyển mode)
         if state["current_task"] is None and not state["task_queue"]:
             return load_next_mode_bot(user_id)
         else:
             return "Bạn đang học dở, hãy trả lời câu hỏi hiện tại trước."
             
-    # 2. Trả lời câu hỏi (chạy trước để ưu tiên trả lời)
     if state["current_task"] is not None:
         return check_answer_bot(user_id, user_text)
     
-    # 3. Logic bắt đầu (chỉ chạy khi không có câu hỏi nào đang chờ)
     if user_text in ["học", "bắt đầu", "start"]: 
         return start_new_session_bot(user_id)
     
-    # 4. Lệnh khác
     elif user_text in ["bỏ qua", "skip", "dap an"]:
-        # Cần phải thực hiện việc bỏ qua ở đây thay vì trả lời 'Bạn chưa bắt đầu học'
         if state["current_task"] is not None:
-            # Nếu có câu hỏi đang chạy, thực hiện logic bỏ qua
             state["mistake_made"] = True
             hanzi = state["current_task"]["hanzi"]
             word = HSK_MAP.get(hanzi, HSK_DATA[0])
             next_question = get_next_question(user_id)
             return (f"⏩ Bỏ qua\nĐáp án là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\n\n") + next_question
         else:
-            # Nếu không có câu hỏi nào
             return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
             
     elif user_text in ["điểm", "score"]: 
@@ -286,26 +273,29 @@ def check_and_send_reminders_async():
     if not DB:
         print("Cannot check reminders: DB connection error.")
         return
-        
-    users_ref = DB.collection('users')
-    docs = users_ref.where('last_study_time', '>', 0).get() 
-    current_time = time.time()
     
-    for doc in docs:
-        user_id = doc.id
-        state = doc.to_dict()
+    try:
+        # Lấy tất cả người dùng từ DB
+        CURSOR.execute("SELECT user_id, state, last_study_time FROM users WHERE last_study_time > 0")
+        docs = CURSOR.fetchall()
+        current_time = time.time()
         
-        # Check if 1 hour passed and reminder hasn't been sent
-        if (current_time - state.get('last_study_time', 0)) > REMINDER_INTERVAL_SECONDS and not state.get('reminder_sent', False):
+        for user_id, state, last_study_time in docs:
+            # PostgreSQL lưu last_study_time là integer
             
-            # Send Facebook reminder
-            reminder_message = "🔔 Đã 1 tiếng rồi! Bạn có muốn học tiếp không?\n\nGõ 'học' để tiếp tục phiên học HSK của bạn nhé!"
-            send_facebook_message(user_id, reminder_message)
-            
-            # Update reminder flag in DB
-            state['reminder_sent'] = True
-            save_user_state(user_id, state, update_time=False)
-            print(f"--> Sent reminder to user: {user_id}")
+            # Check if 1 hour passed and reminder hasn't been sent
+            if (current_time - last_study_time) > REMINDER_INTERVAL_SECONDS and not state.get('reminder_sent', False):
+                
+                reminder_message = "🔔 Đã 1 tiếng rồi! Bạn có muốn học tiếp không?\n\nGõ 'học' để tiếp tục phiên học HSK của bạn nhé!"
+                send_facebook_message(user_id, reminder_message)
+                
+                # Cập nhật cờ nhắc nhở trong DB
+                state['reminder_sent'] = True
+                save_user_state(user_id, state, update_time=False)
+                print(f"--> Sent reminder to user: {user_id}")
+                
+    except Exception as e:
+        print(f"LỖI POSTGRESQL KHI KIỂM TRA NHẮC NHỞ: {e}")
         
 # --- API ENDPOINTS ---
 
@@ -315,13 +305,11 @@ async def check_reminders_endpoint(background_tasks: BackgroundTasks):
     background_tasks.add_task(check_and_send_reminders_async)
     return {"status": "Reminder check started in background."}
 
-# Standard API for PC App
 @app.get("/api/new_session")
 def create_new_session_pc(count: int = 10):
     session_words = random.sample(HSK_DATA, min(count, len(HSK_DATA)))
     return {"message": "ok", "data": session_words}
 
-# Webhook Verification
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -334,7 +322,6 @@ async def verify_webhook(request: Request):
             raise HTTPException(status_code=403, detail="Sai mật khẩu Verify Token")
     return {"status": "Đây là đường dẫn Webhook"}
 
-# Webhook Message Handler
 @app.post("/webhook")
 async def handle_message(request: Request):
     data = await request.json()
