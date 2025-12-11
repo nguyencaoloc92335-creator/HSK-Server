@@ -180,6 +180,23 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     user_text = user_text.lower().strip()
     state = get_user_state(user_id)
     
+    # NEW: Hướng dẫn
+    if user_text in ["hướng dẫn", "help", "menu"]:
+        return (
+            f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
+            f"1. Bắt đầu phiên học:\n"
+            f"   Gõ: `học` hoặc `bắt đầu`\n"
+            f"   -> Bot sẽ chọn ngẫu nhiên 10 từ và bắt đầu Dạng 1.\n\n"
+            f"2. Chế độ học tập:\n"
+            f"   Bot sẽ đố bạn qua 4 Dạng bài liên tục, giống hệt App PC.\n"
+            f"   *Lưu ý: Bạn phải trả lời đúng 100% (Perfect Run) mới qua được Dạng tiếp theo!*\n\n"
+            f"3. Các lệnh trong khi học:\n"
+            f"   - Gõ: `bỏ qua` hoặc `dap an`: Xem đáp án và chuyển sang câu mới.\n"
+            f"   - Gõ: `điểm` hoặc `score`: Xem thống kê kết quả hiện tại.\n\n"
+            f"4. Nhắc nhở:\n"
+            f"   - Bot sẽ tự động nhắn tin nhắc nhở bạn sau mỗi 1 tiếng nếu bạn không tương tác."
+        )
+
     if user_text in ["học", "bắt đầu", "start"]: return start_new_session_bot(user_id)
     
     elif user_text in ["bỏ qua", "skip", "dap an"]:
@@ -193,7 +210,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
         
     elif state["current_task"] is not None: return check_answer_bot(user_id, user_text)
         
-    else: return "Chào bạn! Gõ 'học' để bắt đầu ôn tập nhanh.\n(Gõ 'điểm' để xem kết quả)."
+    else: return "Chào bạn! Gõ 'học' để bắt đầu ôn tập nhanh.\n(Gõ 'điểm' hoặc 'hướng dẫn' để xem thêm)."
 
 
 # --- REMINDER LOGIC ---
