@@ -83,6 +83,8 @@ def start_new_session_bot(user_id: str) -> str:
         "session_words": session_words, "mode_index": 0, "score": 0, "total_questions": 0
     })
     save_user_state(user_id, state)
+    
+    # Khởi động Mode đầu tiên
     return load_next_mode_bot(user_id)
 
 def load_next_mode_bot(user_id: str) -> str:
@@ -90,11 +92,14 @@ def load_next_mode_bot(user_id: str) -> str:
     state = get_user_state(user_id)
     
     if state["mode_index"] >= len(BOT_MODES):
+        # Kết thúc session
         state["task_queue"] = []; state["current_task"] = None
         save_user_state(user_id, state)
         return "🎉 CHÚC MỪNG! Bạn đã hoàn thành xuất sắc phiên học này!\n\nGõ 'học' để bắt đầu phiên mới."
 
     current_mode = BOT_MODES[state["mode_index"]]
+    
+    # Thiết lập Task Queue cho Mode mới
     state["task_queue"] = []
     for word in state["session_words"]:
         state["task_queue"].append({"word": word, "mode_name": current_mode["name"]})
@@ -104,29 +109,43 @@ def load_next_mode_bot(user_id: str) -> str:
     state["mistake_made"] = False
     
     save_user_state(user_id, state)
-    return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id)
+    
+    # Trả về thông báo bắt đầu và câu hỏi đầu tiên
+    return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id, is_new_mode=True)
 
-def get_next_question(user_id: str) -> str:
-    """Retrieves the next question from the queue."""
+def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
+    """Retrieves the next question from the queue. FIX LỖI: Loại bỏ gọi đệ quy."""
     state = get_user_state(user_id)
 
-    # Check Perfect Run Rule
+    # 1. Kiểm tra luật Perfect Run (Khi hết Task Queue)
     if not state["task_queue"]:
         if state["mistake_made"]:
+            # Sai -> Trộn lại và làm lại mode này
             state["task_queue"] = list(state["backup_queue"])
             random.shuffle(state["task_queue"])
             state["mistake_made"] = False
             save_user_state(user_id, state)
             return "❌ BẠN ĐÃ SAI!\nLàm lại Dạng này cho đến khi đúng hết 100% nhé.\n\n" + get_next_question(user_id)
         else:
+            # Đúng 100% -> Tăng Mode Index và trả về Lệnh chuyển Mode
             state["mode_index"] += 1
             save_user_state(user_id, state)
-            return "✅ HOÀN THÀNH DẠNG BÀI!\n\n" + load_next_mode_bot(user_id)
-
-    # Fetch next task
+            
+            # Kiểm tra xem có kết thúc luôn không
+            if state["mode_index"] >= len(BOT_MODES):
+                return load_next_mode_bot(user_id)
+            else:
+                # Nếu chưa kết thúc, trả về thông báo hoàn thành Mode và chạy Mode tiếp theo
+                return "✅ HOÀN THÀNH DẠNG BÀI!\n\n" + load_next_mode_bot(user_id)
+            
+    # 2. Lấy task tiếp theo
     task = state["task_queue"].pop(0)
     state["current_task"] = task
-    state["total_questions"] += 1
+    
+    # Chỉ tăng total_questions khi không phải là lỗi đệ quy/lặp lại
+    if not is_new_mode:
+        state["total_questions"] += 1
+    
     save_user_state(user_id, state)
     
     word = task["word"]
@@ -207,7 +226,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     
     # 3. Lệnh khác
     elif user_text in ["bỏ qua", "skip", "dap an"]:
-        # Lỗi: Không có task nào để bỏ qua
+        # Xử lý bỏ qua (khi không có task)
         return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
             
     elif user_text in ["điểm", "score"]: return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
