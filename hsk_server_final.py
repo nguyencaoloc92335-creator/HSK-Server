@@ -114,13 +114,15 @@ def ai_generate_example(word_data):
     meaning = word_data['Nghĩa']
     
     prompt = f"""
-    Hãy tạo một câu ví dụ tiếng Trung ngắn gọn, đơn giản (HSK 2) cho từ: "{hanzi}" (Nghĩa: {meaning}).
+    Hãy tạo một câu ví dụ tiếng Trung ngắn gọn, đơn giản (trình độ HSK 2) cho từ vựng này: "{hanzi}" (Nghĩa: {meaning}).
+    
     Yêu cầu bắt buộc:
-    1. Câu ví dụ phải khác với câu mẫu: "{word_data['Ví dụ']}".
-    2. Phải cung cấp đủ 3 thành phần: Câu chữ Hán, Pinyin, Dịch tiếng Việt.
+    1. Câu ví dụ phải khác với câu mẫu trong sách: "{word_data['Ví dụ']}".
+    2. Phải cung cấp đủ 3 thành phần: Câu chữ Hán, Pinyin chuẩn (có thanh điệu), Dịch tiếng Việt.
     3. Trả về định dạng JSON duy nhất: {{"han": "...", "pinyin": "...", "viet": "..."}}
     """
     try:
         response = model.generate_content(prompt)
         txt = response.text.strip()
+        # Clean markdown code blocks if present
         if "
