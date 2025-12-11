@@ -18,7 +18,7 @@ import psycopg2
 from psycopg2 import pool
 import google.generativeai as genai
 
-# --- 0. CẤU HÌNH LOGGING CHI TIẾT ---
+# --- 0. CẤU HÌNH LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,10 @@ except ImportError:
     HSK_DATA = [{"Hán tự": "你好", "Pinyin": "nǐhǎo", "Nghĩa": "xin chào", "Ví dụ": "你好!", "Ví dụ Pinyin": "Nǐ hǎo!", "Dịch câu": "Chào bạn!"}]
     HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
 
-# --- 3. DATABASE POOL (THÊM TIMEOUT) ---
+# --- 3. DATABASE POOL ---
 db_pool = None
 if DATABASE_URL:
     try:
-        # Thêm connect_timeout để không bị treo mãi mãi nếu DB ngủ
         db_pool = psycopg2.pool.ThreadedConnectionPool(
             1, 10, DATABASE_URL, sslmode='require', connect_timeout=5
         )
@@ -71,21 +70,15 @@ def get_db_conn():
     if db_pool:
         try:
             return db_pool.getconn()
-        except Exception as e:
-            logger.error(f"Lỗi lấy kết nối DB: {e}")
-            return None
+        except: return None
     return None
 
 def release_db_conn(conn):
     if db_pool and conn:
-        try:
-            db_pool.putconn(conn)
-        except:
-            pass
+        try: db_pool.putconn(conn)
+        except: pass
 
 def get_user_state(user_id: str) -> Dict[str, Any]:
-    logger.info(f"--- [STEP 1] Lấy trạng thái user: {user_id}")
-    
     default_state = {
         "user_id": user_id,
         "mode": "IDLE",            
@@ -101,16 +94,12 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
         "reminder_count": 0        
     }
 
-    # 1. Ưu tiên Cache
     if user_id in USER_CACHE:
-        logger.info(f"--- [STEP 1.1] Tìm thấy trong Cache")
         merged = default_state.copy()
         merged.update(USER_CACHE[user_id])
         return merged
 
-    # 2. Tìm DB
     if db_pool:
-        logger.info(f"--- [STEP 1.2] Đọc từ DB...")
         conn = get_db_conn()
         if conn:
             try:
@@ -119,7 +108,6 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
                     cur.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
                     res = cur.fetchone()
                     if res:
-                        logger.info(f"--- [STEP 1.3] Đã lấy dữ liệu từ DB")
                         db_data = res[0]
                         final_state = default_state.copy()
                         final_state.update(db_data if isinstance(db_data, dict) else {})
@@ -129,10 +117,6 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
                 logger.error(f"DB Read Error: {e}")
             finally:
                 release_db_conn(conn)
-        else:
-            logger.warning("Không lấy được kết nối DB, dùng bộ nhớ tạm.")
-    
-    logger.info(f"--- [STEP 1.4] Tạo mới user state")
     return default_state
 
 def save_user_state(user_id: str, state: Dict[str, Any]):
@@ -161,7 +145,7 @@ def reset_user_state(user_id: str):
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
                     conn.commit()
-            except Exception: pass
+            except: pass
             finally: release_db_conn(conn)
 
 def clear_learning_history(user_id: str, state: Dict[str, Any]):
@@ -172,17 +156,46 @@ def clear_learning_history(user_id: str, state: Dict[str, Any]):
     save_user_state(user_id, state)
     send_fb_message(user_id, "🔄 Đã xóa toàn bộ lịch sử học tập! Gõ 'Bắt đầu' để học lại từ đầu.")
 
-# --- 5. AI & HELPERS ---
+# --- 5. AI & HELPERS (SMART REPLY) ---
 
-def ai_chat_chit(message: str) -> str:
-    logger.info(f"--- [AI] Đang gọi Gemini chat chit: {message}")
+def ai_smart_reply(message: str, context_type: str) -> str:
+    """
+    Dùng AI để trả lời người dùng khi họ nói câu lệnh không xác định.
+    Đồng thời gợi ý lệnh hợp lý dựa trên ngữ cảnh.
+    """
+    command_hint = ""
+    context_desc = ""
+    
+    if context_type == 'IDLE':
+        context_desc = "User đang rảnh. Bạn muốn họ bắt đầu học."
+        command_hint = "Lệnh gợi ý: 'Bắt đầu', 'Hướng dẫn', 'Tiến độ'"
+    elif context_type == 'WAITING_CONFIRM':
+        context_desc = "User vừa nhận từ mới. Hệ thống đang đợi họ gõ 'Hiểu' hoặc 'OK' để đếm giờ."
+        command_hint = "Lệnh gợi ý: 'Hiểu' (để xác nhận), 'Dừng', 'Ví dụ khác'"
+    elif context_type == 'WAITING_TIMER':
+        context_desc = "User đang trong thời gian chờ 10 phút để nhận từ tiếp theo. Họ có thể gõ 'Tiếp' để học luôn."
+        command_hint = "Lệnh gợi ý: 'Tiếp' (học luôn), 'Bao lâu' (xem giờ), 'Dừng'"
+    elif context_type == 'QUIZ':
+        context_desc = "User đang làm bài kiểm tra. Họ chat linh tinh thay vì trả lời."
+        command_hint = "Nhắc họ trả lời đáp án (ví dụ gõ lại chữ Hán, hoặc nghĩa tiếng Việt)."
+
     try:
-        prompt = f"Bạn là trợ lý HSK. User nói: '{message}'. Trả lời ngắn gọn, nhắc họ gõ 'Bắt đầu' để vào chế độ học tự động."
+        prompt = f"""
+        Bạn là trợ lý HSK thân thiện.
+        Tin nhắn user: "{message}"
+        Ngữ cảnh hệ thống: {context_desc}
+        Các lệnh khả dụng: {command_hint}
+        
+        Nhiệm vụ: 
+        1. Trả lời tin nhắn của user một cách tự nhiên, vui vẻ (trả lời câu hỏi của họ nếu có).
+        2. Khéo léo nhắc họ dùng các lệnh khả dụng để tiếp tục luồng học.
+        3. Ngắn gọn (dưới 50 từ). Tiếng Việt.
+        """
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        logger.error(f"AI Error: {e}")
-        return "Chào bạn! Gõ 'Bắt đầu' để học nhé! 😄"
+        logger.error(f"AI Smart Reply Error: {e}")
+        return "Chào bạn! Mình là Bot HSK. Gõ 'Hướng dẫn' để xem menu nhé! 😄"
 
 def ai_generate_example_smart(word_data: dict) -> dict:
     hanzi = word_data.get('Hán tự', '')
@@ -202,41 +215,37 @@ def ai_generate_example_smart(word_data: dict) -> dict:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match: return json.loads(match.group())
         return backup
-    except Exception as e:
-        logger.error(f"AI Gen Error: {e}")
+    except:
         return backup
 
 def send_fb_message(user_id: str, text: str):
-    logger.info(f"--- [FB SEND] Đang gửi tới {user_id}: {text[:30]}...")
+    logger.info(f"--- [FB SEND] To {user_id}: {text[:30]}...")
     params = {"access_token": PAGE_ACCESS_TOKEN}
     headers = {"Content-Type": "application/json"}
     data = {"recipient": {"id": user_id}, "message": {"text": text}}
     try:
-        # THÊM TIMEOUT 10s ĐỂ KHÔNG BỊ TREO
         r = requests.post("https://graph.facebook.com/v16.0/me/messages", params=params, headers=headers, json=data, timeout=10)
         if r.status_code != 200:
-            logger.error(f"❌ LỖI GỬI FB: {r.status_code} - {r.text}")
-        else:
-            logger.info("✅ Gửi FB thành công.")
+            logger.error(f"❌ FB ERROR: {r.status_code} - {r.text}")
     except Exception as e:
-        logger.error(f"❌ LỖI KẾT NỐI FB: {e}")
+        logger.error(f"❌ FB EXCEPTION: {e}")
 
 def get_vietnam_time():
     return datetime.now(timezone(timedelta(hours=7)))
 
 def send_guide_message(user_id: str):
     guide_text = (
-        "🤖 **HƯỚNG DẪN** 🤖\n\n"
+        "🤖 **HƯỚNG DẪN SỬ DỤNG** 🤖\n\n"
         "1️⃣ **Học tập:**\n"
-        "   - Gõ `Bắt đầu`: Bot gửi từ vựng.\n"
-        "   - Gõ `Hiểu`: Bot sẽ **đếm 10 phút** rồi gửi từ tiếp theo.\n"
-        "   - Đủ 6 từ sẽ kiểm tra.\n\n"
+        "   - `Bắt đầu`: Bot gửi 1 từ.\n"
+        "   - `Hiểu`: Xác nhận đã học -> Đếm ngược 10p gửi từ tiếp.\n"
+        "   - `Tiếp`: Bỏ qua chờ đợi, nhận từ mới ngay.\n\n"
         "2️⃣ **Tiện ích:**\n"
-        "   - `Tiến độ`: Xem số từ đã học.\n"
-        "   - `Bao lâu`: Xem thời gian còn lại.\n"
+        "   - `Tiến độ`: Xem thống kê.\n"
+        "   - `Bao lâu`: Xem thời gian chờ còn lại.\n"
         "   - `Chào buổi sáng`: Học tiếp tiến độ cũ.\n"
-        "   - `Học lại`: Xóa lịch sử.\n"
-        "   - `Dừng`: Nghỉ ngơi.\n\n"
+        "   - `Học lại`: Xóa lịch sử, học từ đầu.\n"
+        "   - `Dừng`: Tạm ngưng.\n\n"
         "Bot nghỉ từ 0h-6h sáng."
     )
     send_fb_message(user_id, guide_text)
@@ -245,66 +254,50 @@ def send_guide_message(user_id: str):
 
 def process_message_background(user_id: str, message_text: str):
     try:
-        logger.info(f"========== BẮT ĐẦU XỬ LÝ: {message_text} ==========")
+        logger.info(f"MSG from {user_id}: {message_text}")
         state = get_user_state(user_id)
         msg = message_text.strip().lower()
 
-        logger.info(f"--- [LOGIC] Mode hiện tại: {state.get('mode')}")
-
-        # --- NHÓM LỆNH HỆ THỐNG ---
-        if any(cmd in msg for cmd in ['hướng dẫn', 'huong dan', 'help', 'giới thiệu', 'menu']):
+        # --- LỆNH HỆ THỐNG ƯU TIÊN ---
+        if any(cmd in msg for cmd in ['hướng dẫn', 'huong dan', 'help', 'menu']):
             send_guide_message(user_id)
             return
 
-        # --- KIỂM TRA TIẾN ĐỘ ---
-        if any(cmd in msg for cmd in ['tiến độ', 'tien do', 'progress', 'bao nhiêu từ', 'học được bao nhiêu', 'thống kê']):
-            learned_count = len(state.get("learned_history", []))
-            total_count = len(HSK_DATA)
-            percent = (learned_count / total_count) * 100 if total_count > 0 else 0
-            
-            msg_reply = (
-                f"📊 **THỐNG KÊ TIẾN ĐỘ**\n"
-                f"- Đã học: {learned_count} từ\n"
-                f"- Tổng số: {total_count} từ\n"
-                f"- Hoàn thành: {percent:.1f}%\n\n"
-                f"Cố gắng lên nhé! 🚀"
-            )
-            send_fb_message(user_id, msg_reply)
+        if any(cmd in msg for cmd in ['tiến độ', 'thống kê']):
+            cnt = len(state.get("learned_history", []))
+            total = len(HSK_DATA)
+            send_fb_message(user_id, f"📊 Tiến độ: {cnt}/{total} từ ({(cnt/total*100):.1f}%).")
             return
 
-        # --- KIỂM TRA THỜI GIAN CÒN LẠI ---
-        if any(cmd in msg for cmd in ['bao lâu', 'khi nào', 'mấy phút', 'thời gian', 'time', 'chờ bao lâu']):
+        if any(cmd in msg for cmd in ['bao lâu', 'khi nào', 'thời gian']):
             mode = state.get("mode", "IDLE")
             if mode != "AUTO_LEARNING":
-                send_fb_message(user_id, "Bạn chưa bắt đầu chế độ học tự động. Gõ 'Bắt đầu' nhé!")
+                send_fb_message(user_id, "Bạn chưa bắt đầu học. Gõ 'Bắt đầu' nhé!")
                 return
-                
-            if state.get("waiting_confirm", False):
-                send_fb_message(user_id, "Bot đang chờ bạn xác nhận 'Hiểu' để bắt đầu tính giờ nha!")
-                return
-                
-            next_time = state.get("next_action_time", 0)
-            now = int(time.time())
-            remaining = next_time - now
             
-            if remaining > 0:
-                mins = remaining // 60
-                secs = remaining % 60
-                send_fb_message(user_id, f"⏳ Còn khoảng {mins} phút {secs} giây nữa là đến từ tiếp theo.\nNếu muốn học luôn, hãy gõ 'Tiếp'.")
+            if state.get("waiting_confirm", False):
+                send_fb_message(user_id, "Đang chờ bạn gõ 'Hiểu' để bắt đầu tính giờ nha!")
+                return
+                
+            remain = state.get("next_action_time", 0) - int(time.time())
+            if remain > 0:
+                mins = remain // 60
+                secs = remain % 60
+                send_fb_message(user_id, f"⏳ Còn {mins} phút {secs} giây. Gõ 'Tiếp' để học luôn.")
             else:
-                send_fb_message(user_id, "⏰ Đã đến giờ rồi! Bot đang chuẩn bị gửi từ ngay đây...")
+                send_fb_message(user_id, "⏰ Đã đến giờ! Đang gửi từ...")
             return
 
-        if any(cmd in msg for cmd in ['học lại', 'hoc lai', 'reset history', 'xóa lịch sử']):
+        if any(cmd in msg for cmd in ['học lại', 'xóa lịch sử']):
             clear_learning_history(user_id, state)
             return
 
         if msg == "reset":
             reset_user_state(user_id)
-            send_fb_message(user_id, "⚙️ Đã Reset kỹ thuật. Gõ 'Bắt đầu' để học.")
+            send_fb_message(user_id, "⚙️ Reset xong. Gõ 'Bắt đầu'.")
             return
 
-        if any(keyword in msg for keyword in ['chào buổi sáng', 'buổi sáng', 'good morning', 'morning', 'dậy rồi']):
+        if any(keyword in msg for keyword in ['chào buổi sáng', 'good morning', 'morning']):
             send_fb_message(user_id, "🌞 Chào buổi sáng! Tiếp tục học nào! 🚀")
             state["mode"] = "AUTO_LEARNING"
             state["next_action_time"] = int(time.time())
@@ -312,7 +305,7 @@ def process_message_background(user_id: str, message_text: str):
             save_user_state(user_id, state)
             return
 
-        if any(cmd in msg for cmd in ['bắt đầu', 'bat dau', 'start']):
+        if any(cmd in msg for cmd in ['bắt đầu', 'start']):
             start_auto_learning(user_id, state)
             return
         
@@ -322,58 +315,63 @@ def process_message_background(user_id: str, message_text: str):
             send_fb_message(user_id, "Đã dừng. Hẹn gặp lại! 👋")
             return
 
-        # --- XỬ LÝ THEO CHẾ ĐỘ ---
+        # --- XỬ LÝ THEO CHẾ ĐỘ (CÓ AI FALLBACK) ---
         mode = state.get("mode", "IDLE")
 
         if mode == "IDLE":
-            logger.info("--- [LOGIC] Vào mode IDLE -> Gọi AI")
-            reply = ai_chat_chit(message_text)
+            # Nếu người dùng chat linh tinh khi đang rảnh -> AI trả lời + Gợi ý bắt đầu
+            reply = ai_smart_reply(message_text, 'IDLE')
             send_fb_message(user_id, reply)
 
         elif mode == "AUTO_LEARNING":
+            # Kiểm tra giờ ngủ
             vn_now = get_vietnam_time()
             if 0 <= vn_now.hour < 6:
-                send_fb_message(user_id, "🌙 Giờ đi ngủ (0h-6h). Mai học tiếp nhé!")
+                send_fb_message(user_id, "🌙 Đang giờ nghỉ (0h-6h). Mai học tiếp nhé!")
                 return
 
             if state.get("waiting_confirm", False):
-                if any(w in msg for w in ["hiểu", "ok", "rồi", "yes", "tiếp", "đã xem", "ok bot"]):
+                # Đang chờ xác nhận 'Hiểu'
+                if any(w in msg for w in ["hiểu", "ok", "rồi", "yes", "tiếp", "đã xem"]):
                     next_time = int(time.time()) + 600
                     state["next_action_time"] = next_time
                     state["waiting_confirm"] = False 
                     state["reminder_count"] = 0
-                    send_fb_message(user_id, f"Tuyệt vời! 👍 Đồng hồ đã chạy. 10 phút nữa mình sẽ gửi từ tiếp theo.")
+                    send_fb_message(user_id, f"Tuyệt vời! 👍 Đã ghi nhận. 10 phút nữa sẽ có từ mới.")
                     save_user_state(user_id, state)
                 else:
-                    send_fb_message(user_id, "Bạn gõ 'Hiểu' hoặc 'OK' để mình bắt đầu tính giờ 10 phút nhé!")
+                    # Chat linh tinh khi đang chờ confirm -> AI xử lý
+                    reply = ai_smart_reply(message_text, 'WAITING_CONFIRM')
+                    send_fb_message(user_id, reply)
             else:
+                # Đang trong thời gian chờ 10 phút
                 if "tiếp" in msg:
-                    state["next_action_time"] = int(time.time()) 
-                    save_user_state(user_id, state)
+                    # User muốn học luôn
+                    # Gọi trực tiếp hàm gửi để tránh delay của loop
+                    send_next_auto_word(user_id, state)
                 else:
-                    remain = state.get("next_action_time", 0) - int(time.time())
-                    if remain > 0:
-                        minutes = remain // 60
-                        send_fb_message(user_id, f"Còn {minutes} phút nữa. Gõ 'Tiếp' để học luôn, hoặc 'Tiến độ' để xem thống kê.")
+                    # Chat linh tinh khi đang đếm ngược -> AI xử lý
+                    reply = ai_smart_reply(message_text, 'WAITING_TIMER')
+                    send_fb_message(user_id, reply)
 
         elif mode == "QUIZ":
+            # Trong Quiz, ưu tiên check đáp án. Nếu sai hoặc chat linh tinh thì báo sai (hoặc AI gợi ý)
             check_quiz_answer(user_id, state, message_text)
             
     except Exception as e:
-        logger.error(f"❌ FATAL ERROR in logic: {e}")
+        logger.error(f"❌ LOGIC ERROR: {e}")
 
 def start_auto_learning(user_id, state):
     state["mode"] = "AUTO_LEARNING"
     state["session_words"] = [] 
     
-    learned_count = len(state.get("learned_history", []))
-    total_count = len(HSK_DATA)
+    cnt = len(state.get("learned_history", []))
+    total = len(HSK_DATA)
     
-    send_fb_message(user_id, f"🚀 Bắt đầu!\nTiến độ: {learned_count}/{total_count}.\nGửi ngay từ đầu tiên...")
+    send_fb_message(user_id, f"🚀 Bắt đầu học tự động!\nTiến độ: {cnt}/{total}.\nĐang gửi từ đầu tiên...")
     
-    state["next_action_time"] = int(time.time())
-    state["waiting_confirm"] = False 
-    save_user_state(user_id, state)
+    # Gửi ngay lập tức
+    send_next_auto_word(user_id, state)
 
 def send_next_auto_word(user_id, state):
     vn_now = get_vietnam_time()
@@ -383,37 +381,38 @@ def send_next_auto_word(user_id, state):
         start_quiz_session(user_id, state)
         return
 
-    learned_history = set(state.get("learned_history", []))
-    available_words = [w for w in HSK_DATA if w['Hán tự'] not in learned_history]
+    history = set(state.get("learned_history", []))
+    available = [w for w in HSK_DATA if w['Hán tự'] not in history]
     
-    if not available_words:
-        send_fb_message(user_id, "🎉 Đã học hết thư viện từ! Reset lại nhé.")
+    if not available:
+        send_fb_message(user_id, "🎉 Chúc mừng! Bạn đã học hết thư viện từ. Reset lại nhé.")
         state["learned_history"] = [] 
-        available_words = HSK_DATA 
-        learned_history = set()
+        available = HSK_DATA 
+        history = set()
 
-    new_word = random.choice(available_words)
+    new_word = random.choice(available)
     state["session_words"].append(new_word)
     
-    current_history = state.get("learned_history", [])
-    if new_word['Hán tự'] not in current_history:
-        current_history.append(new_word['Hán tự'])
-        state["learned_history"] = current_history
+    cur_hist = state.get("learned_history", [])
+    if new_word['Hán tự'] not in cur_hist:
+        cur_hist.append(new_word['Hán tự'])
+        state["learned_history"] = cur_hist
 
     ex = ai_generate_example_smart(new_word)
-    progress_str = f"{len(current_history)}/{len(HSK_DATA)}"
     
     content = (
-        f"🔔 [Từ #{len(state['session_words'])} - Tổng {progress_str}]\n"
+        f"🔔 [Từ #{len(state['session_words'])}]\n"
         f"📖 {new_word['Hán tự']} ({new_word['Pinyin']})\n"
         f"Nghĩa: {new_word['Nghĩa']}\n"
         f"----------------\n"
         f"Ví dụ: {ex['han']}\n{ex['pinyin']}\n👉 {ex['viet']}\n\n"
-        f"👉 Gõ 'Hiểu' để bắt đầu đếm ngược 10 phút cho từ tiếp theo."
+        f"👉 Gõ 'Hiểu' để xác nhận và đếm giờ (10p)."
     )
     send_fb_message(user_id, content)
     
+    # Set trạng thái chờ xác nhận
     state["waiting_confirm"] = True
+    # Đặt thời gian next action rất xa để loop không tự gửi nhầm
     state["next_action_time"] = int(time.time()) + 999999 
     state["last_msg_time"] = int(time.time()) 
     save_user_state(user_id, state)
@@ -484,6 +483,7 @@ def check_quiz_answer(user_id, state, user_ans):
     explanation = f"Đáp án: {target['Hán tự']} ({pinyin}) - {meaning}"
     q_type = state.get("quiz_type", "HAN_VIET")
 
+    # (Logic check đáp án giữ nguyên như cũ, chỉ thêm AI hỗ trợ nếu cần - nhưng ở đây giữ đơn giản)
     if q_type == "HAN_VIET":
         if any(kw in user_ans for kw in meaning.lower().replace(",", " ").split() if len(kw) > 1): is_correct = True
     elif q_type == "VIET_HAN":
@@ -517,18 +517,16 @@ def finish_session(user_id, state):
     
     state["mode"] = "AUTO_LEARNING"
     state["session_words"] = [] 
-    state["next_action_time"] = int(time.time())
-    state["waiting_confirm"] = False
-    save_user_state(user_id, state)
+    # Gửi từ tiếp theo luôn sau khi thi xong
+    send_next_auto_word(user_id, state)
 
 # --- 8. LUỒNG CHẠY NGẦM ---
 
 def auto_learning_loop():
-    logger.info("--> Auto Learning Loop started.")
+    logger.info("--> Loop started.")
     while True:
         try:
             time.sleep(30) 
-            
             vn_now = get_vietnam_time()
             if 0 <= vn_now.hour < 6: continue
 
@@ -537,24 +535,25 @@ def auto_learning_loop():
             
             for user_id, state in active_users:
                 mode = state.get("mode", "IDLE")
-                
                 if mode != "AUTO_LEARNING": continue
 
+                # Nếu KHÔNG PHẢI đang chờ confirm (tức là đang đếm ngược timer)
                 if not state.get("waiting_confirm", False):
                     next_time = state.get("next_action_time", 0)
                     if now_ts >= next_time:
-                        logger.info(f"Time reached. Sending word to {user_id}")
+                        logger.info(f"Time reached for {user_id}")
                         send_next_auto_word(user_id, state)
-
+                
+                # Nếu ĐANG chờ confirm quá lâu (15p) -> Nhắc
                 else:
                     last_msg = state.get("last_msg_time", 0)
-                    if now_ts - last_msg > 900: 
-                        reminder_count = state.get("reminder_count", 0)
-                        if reminder_count < 1: 
-                            send_fb_message(user_id, "🔔 Bạn ơi, bạn đã hiểu từ vừa rồi chưa? Gõ 'Hiểu' để mình đếm giờ gửi từ tiếp theo nhé!")
+                    if now_ts - last_msg > 900:
+                        reminded = state.get("reminder_count", 0)
+                        if reminded < 1:
+                            send_fb_message(user_id, "🔔 Quên xác nhận 'Hiểu' à? Gõ lại để mình tính giờ nhé!")
                             state["reminder_count"] = 1
-                            state["last_msg_time"] = int(time.time()) 
-                            save_user_state(user_id, state, )
+                            state["last_msg_time"] = now_ts
+                            save_user_state(user_id, state)
 
         except Exception as e:
             logger.error(f"Loop Error: {e}")
@@ -574,22 +573,15 @@ def verify(request: Request):
 async def webhook(request: Request, bg_tasks: BackgroundTasks):
     try:
         data = await request.json()
-        
-        # LOG CHI TIẾT GÓI TIN NHẬN ĐƯỢC
-        logger.info(f"RECEIVED PAYLOAD: {json.dumps(data)}")
-        
+        logger.info(f"PAYLOAD: {json.dumps(data)}")
         if 'entry' in data:
             for e in data['entry']:
                 for m in e.get('messaging', []):
                     if 'message' in m:
                         sender_id = m['sender']['id']
                         text = m['message'].get('text', '')
-                        # Bỏ qua tin nhắn không có text (ví dụ sticker) để tránh lỗi
                         if text:
                             bg_tasks.add_task(process_message_background, sender_id, text)
-                        else:
-                            logger.info(f"Bỏ qua tin nhắn không phải text từ {sender_id}")
-                            
         return PlainTextResponse("EVENT_RECEIVED")
     except Exception as e:
         logger.error(f"WEBHOOK ERROR: {e}")
