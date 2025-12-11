@@ -126,6 +126,17 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
             
 # --- BOT QUIZ LOGIC (FIXED) ---
 
+def reset_and_start_new_cycle(user_id: str) -> str:
+    """Xóa toàn bộ tiến trình học và bắt đầu vòng học mới."""
+    state = get_user_state(user_id)
+    state["learned_hanzi"] = [] # Đảm bảo learned_hanzi rỗng
+    
+    # Save the reset state (don't update time as this is a manual reset)
+    save_user_state(user_id, state, update_time=False)
+    
+    # Sau khi reset, bắt đầu ngay giai đoạn học
+    return "✅ ĐÃ RESET TOÀN BỘ TIẾN TRÌNH HỌC!\n" + start_learning_phase(user_id)
+
 def start_learning_phase(user_id: str) -> str:
     """[LỆNH: HỌC / LEARN] Chọn 10 từ mới và bắt đầu giai đoạn Preview."""
     state = get_user_state(user_id)
@@ -180,11 +191,16 @@ def show_next_preview_word(user_id: str) -> str:
     state["current_task"] = {"hanzi": hanzi_to_show, "mode": "PREVIEW"}
     save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi xem từ
 
+    # THAY ĐỔI: Thêm Pinyin Ví dụ vào nội dung hiển thị
+    ví_dụ_pinyin = word.get('Ví dụ Pinyin', 'Không có Pinyin câu ví dụ.')
+
     return (
         f"📖 TỪ MỚI ({WORDS_PER_SESSION - remaining}/{WORDS_PER_SESSION})\n"
         f"🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n"
         f"🇻🇳 Nghĩa: {word['Nghĩa']}\n"
-        f"Ví dụ: {word['Ví dụ']}\n"
+        f"Câu Ví dụ (Hán): {word['Ví dụ']}\n"
+        f"Pinyin Ví dụ: {ví_dụ_pinyin}\n"
+        f"Dịch câu: {word['Dịch câu']}\n"
         f"Gõ `tiếp tục` hoặc `continue` để xem từ tiếp theo, hoặc gõ `bắt đầu` để vào bài kiểm tra."
     )
 
@@ -286,7 +302,7 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
         masked = word["Ví dụ"].replace(word["Hán tự"], "___")
         return f"({remaining} câu còn lại)\nViết Hán tự còn thiếu:\n{masked}\n({word['Dịch câu']})"
     elif mode == "translate_sentence":
-        return f"({remaining} câu còn lại)\nDịch câu sau sang Hán tự:\n🇻🇳 {word['Dịch câu']}\n(Gợi ý: {word['Pinyin']})"
+        return f"({remaining} câu còn lại)\nDịch câu sau sang Hán tự:\n🇻🇳 {word['Dịch câu']}\n(Gợi ý: {word['Ví dụ Pinyin']})" # HIỂN THỊ PINYIN CÂU VÍ DỤ
     
     return "Lỗi nạp câu hỏi."
 
@@ -319,7 +335,15 @@ def check_answer_bot(user_id: str, answer: str) -> str:
         feedback = "✅ CHÍNH XÁC!"
     else:
         state["mistake_made"] = True
-        feedback = (f"❌ SAI RỒI!\nĐáp án đúng là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\nCâu mẫu: {word['Ví dụ']}")
+        # THAY ĐỔI: Hiển thị đầy đủ Pinyin Ví dụ
+        ví_dụ_pinyin = word.get('Ví dụ Pinyin', 'N/A')
+        feedback = (
+            f"❌ SAI RỒI!\n"
+            f"Hán tự: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n"
+            f"Nghĩa: 🇻🇳 {word['Nghĩa']}\n"
+            f"Câu đúng: {word['Ví dụ']}\n"
+            f"Pinyin: {ví_dụ_pinyin}"
+        )
     
     save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi TRẢ LỜI
     return feedback + "\n\n" + get_next_question(user_id)
@@ -335,21 +359,28 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
             f"1. GIAI ĐOẠN HỌC (PREVIEW):\n"
             f"   Lệnh: `học` / `learn`\n"
-            f"   -> Chọn 10 từ ngẫu nhiên và hiển thị đầy đủ thông tin để bạn học. Các từ này chưa từng được học trước đó.\n\n"
+            f"   -> Chọn 10 từ ngẫu nhiên (chưa từng học) và hiển thị đầy đủ thông tin.\n\n"
             f"2. GIAI ĐOẠN KIỂM TRA (QUIZ):\n"
             f"   Lệnh: `bắt đầu` / `start`\n"
-            f"   -> Bắt đầu bài kiểm tra 4 Dạng bài với 10 từ bạn vừa học.\n\n"
-            f"3. LỆNH TRONG KHI HỌC:\n"
+            f"   -> Bắt đầu bài kiểm tra 4 Dạng bài với 10 từ bạn vừa học (Perfect Run).\n\n"
+            f"3. ĐẶT LẠI TIẾN TRÌNH:\n"
+            f"   Lệnh: `reset` / `clear`\n"
+            f"   -> Xóa toàn bộ danh sách từ đã học và bắt đầu vòng học mới từ đầu (tất cả {len(ALL_HANZI)} từ).\n\n"
+            f"4. LỆNH TRONG KHI HỌC:\n"
             f"   - Gõ: `tiếp tục` / `continue` (Trong PREVIEW: Xem từ tiếp theo. Trong QUIZ: Bắt đầu Dạng bài mới).\n"
             f"   - Gõ: `bỏ qua` / `skip`: Xem đáp án câu hiện tại (chỉ dùng trong QUIZ).\n"
             f"   - Gõ: `điểm` / `score`: Xem thống kê kết quả hiện tại.\n"
         )
     
-    # --- 2. Xử lý lệnh BẮT ĐẦU HỌC (PREVIEW) ---
+    # --- 2. Xử lý lệnh RESET (XÓA TOÀN BỘ) ---
+    if user_text in ["reset", "clear", "xóa"]:
+        return reset_and_start_new_cycle(user_id)
+
+    # --- 3. Xử lý lệnh BẮT ĐẦU HỌC (PREVIEW) ---
     if user_text in ["học", "learn"]: 
         return start_learning_phase(user_id)
 
-    # --- 3. Xử lý lệnh BẮT ĐẦU KIỂM TRA (QUIZ) ---
+    # --- 4. Xử lý lệnh BẮT ĐẦU KIỂM TRA (QUIZ) ---
     if user_text in ["bắt đầu", "start"]: 
         if state["current_phase"] == "QUIZ":
             return "Bạn đang trong bài kiểm tra rồi! Hãy trả lời câu hỏi hiện tại."
@@ -358,7 +389,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
         
         return start_quiz_phase(user_id)
 
-    # --- 4. Xử lý lệnh TIẾP TỤC ---
+    # --- 5. Xử lý lệnh TIẾP TỤC ---
     if user_text in ["tiếp tục", "continue"]:
         if state["current_phase"] == "PREVIEW":
             return show_next_preview_word(user_id)
@@ -373,11 +404,11 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
         else:
             return "Bạn đang học dở, hãy trả lời câu hỏi hiện tại trước."
 
-    # --- 5. Trả lời câu hỏi (Chỉ chấp nhận trong phase QUIZ) ---
+    # --- 6. Trả lời câu hỏi (Chỉ chấp nhận trong phase QUIZ) ---
     if state["current_phase"] == "QUIZ" and state["current_task"] is not None:
         return check_answer_bot(user_id, user_text)
     
-    # --- 6. Xử lý lệnh BỎ QUA (Chỉ chấp nhận trong phase QUIZ) ---
+    # --- 7. Xử lý lệnh BỎ QUA (Chỉ chấp nhận trong phase QUIZ) ---
     elif user_text in ["bỏ qua", "skip", "dap an"]:
         if state["current_phase"] == "QUIZ" and state["current_task"] is not None:
             state["mistake_made"] = True
@@ -389,11 +420,11 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
         else:
             return "Lệnh `bỏ qua` chỉ dùng trong bài kiểm tra. Gõ `học` để bắt đầu phiên mới."
             
-    # --- 7. Lệnh tra cứu (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME) ---
+    # --- 8. Lệnh tra cứu (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME) ---
     elif user_text in ["điểm", "score"]: 
         return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
         
-    # --- 8. Mặc định/Trạng thái IDLE ---
+    # --- 9. Mặc định/Trạng thái IDLE ---
     else: 
         return "Chào bạn! Gõ `học` hoặc `learn` để bắt đầu ôn tập nhanh.\n(Gõ `hướng dẫn` hoặc `help` để xem thêm các lệnh)."
 
