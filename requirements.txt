@@ -3,3 +3,4 @@ uvicorn
 requests
 firebase_admin
 psycopg2
+google-generativeai
