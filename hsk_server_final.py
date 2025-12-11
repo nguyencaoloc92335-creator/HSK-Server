@@ -100,7 +100,7 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
         try:
             if update_time:
                 state["last_study_time"] = time.time()
-                state["reminder_sent"] = False
+                state["reminder_sent"] = False # <--- BỎ RESET FLAG NẾU KHÔNG CÓ TƯƠNG TÁC THỰC SỰ
             
             # Use ON CONFLICT to UPSERT (UPDATE if exists, INSERT if not exists)
             CURSOR.execute("""
@@ -108,7 +108,7 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
                 VALUES (%s, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE
                 SET state = EXCLUDED.state, last_study_time = EXCLUDED.last_study_time
-            """, (user_id, json.dumps(state), state["last_study_time"]))
+            """, (user_id, json.dumps(state), state.get("last_study_time", 0))) # SỬ DỤNG GET ĐỂ TRÁNH LỖI KEY ERROR NẾU KHÔNG UPDATE TIME
             CONN.commit()
             
         except Exception as e:
@@ -123,7 +123,7 @@ def start_new_session_bot(user_id: str) -> str:
     
     state["session_hanzi"] = [word["Hán tự"] for word in session_words]
     state.update({"mode_index": 0, "score": 0, "total_questions": 0})
-    save_user_state(user_id, state)
+    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi BẮT ĐẦU
     
     return load_next_mode_bot(user_id)
 
@@ -132,7 +132,7 @@ def load_next_mode_bot(user_id: str) -> str:
     
     if state["mode_index"] >= len(BOT_MODES):
         state["task_queue"] = []; state["current_task"] = None
-        save_user_state(user_id, state)
+        save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi KẾT THÚC
         return "🎉 CHÚC MỪNG! Bạn đã hoàn thành xuất sắc phiên học này!\n\nGõ 'học' để bắt đầu phiên mới."
 
     current_mode = BOT_MODES[state["mode_index"]]
@@ -145,8 +145,8 @@ def load_next_mode_bot(user_id: str) -> str:
     state["backup_queue"] = list(state["task_queue"])
     state["mistake_made"] = False
     
-    save_user_state(user_id, state)
-    
+    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi CHUYỂN DẠNG
+
     return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id, is_new_mode=True)
 
 def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
@@ -157,13 +157,13 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
             state["task_queue"] = list(state["backup_queue"])
             random.shuffle(state["task_queue"])
             state["mistake_made"] = False
-            save_user_state(user_id, state)
+            save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi LÀM LẠI
             return "❌ BẠN ĐÃ SAI!\nLàm lại Dạng này cho đến khi đúng hết 100% nhé.\n\n" + get_next_question(user_id)
         else:
             state["mode_index"] += 1
             state["current_task"] = None 
-            save_user_state(user_id, state)
-            
+            save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi HOÀN THÀNH
+
             if state["mode_index"] >= len(BOT_MODES):
                 return load_next_mode_bot(user_id) 
             else:
@@ -175,7 +175,7 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
     if not is_new_mode:
         state["total_questions"] += 1
     
-    save_user_state(user_id, state)
+    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi GỬI CÂU HỎI MỚI
     
     hanzi = task["hanzi"]
     word = HSK_MAP.get(hanzi, HSK_DATA[0])
@@ -218,13 +218,14 @@ def check_answer_bot(user_id: str, answer: str) -> str:
         state["mistake_made"] = True
         feedback = (f"❌ SAI RỒI!\nĐáp án đúng là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\nCâu mẫu: {word['Ví dụ']}")
     
-    save_user_state(user_id, state)
+    save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi TRẢ LỜI
     return feedback + "\n\n" + get_next_question(user_id)
 
 def process_chat_logic(user_id: str, user_text: str) -> str:
     user_text = user_text.lower().strip()
     state = get_user_state(user_id)
     
+    # Hướng dẫn (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME)
     if user_text in ["hướng dẫn", "help", "menu"]:
         return (
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
@@ -237,28 +238,35 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
             f"   - Gõ: `điểm` hoặc `score`: Xem thống kê kết quả hiện tại.\n"
         )
 
+    # 1. Xử lý lệnh TIẾP TỤC (Chuyển mode) - CÓ CẬP NHẬT THỜI GIAN
     if user_text in ["tiếp tục"]:
         if state["current_task"] is None and not state["task_queue"]:
             return load_next_mode_bot(user_id)
         else:
             return "Bạn đang học dở, hãy trả lời câu hỏi hiện tại trước."
             
+    # 2. Trả lời câu hỏi (chạy trước để ưu tiên trả lời)
     if state["current_task"] is not None:
         return check_answer_bot(user_id, user_text)
     
+    # 3. Logic bắt đầu (chỉ chạy khi không có câu hỏi nào đang chờ) - CÓ CẬP NHẬT THỜI GIAN
     if user_text in ["học", "bắt đầu", "start"]: 
         return start_new_session_bot(user_id)
     
+    # 4. Lệnh khác
     elif user_text in ["bỏ qua", "skip", "dap an"]:
+        # CÓ CẬP NHẬT THỜI GIAN
         if state["current_task"] is not None:
             state["mistake_made"] = True
             hanzi = state["current_task"]["hanzi"]
             word = HSK_MAP.get(hanzi, HSK_DATA[0])
             next_question = get_next_question(user_id)
+            save_user_state(user_id, state, update_time=True) # Cập nhật thời gian khi BỎ QUA
             return (f"⏩ Bỏ qua\nĐáp án là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\n\n") + next_question
         else:
             return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
             
+    # Lệnh tra cứu (KHÔNG CẦN CẬP NHẬT LAST_STUDY_TIME)
     elif user_text in ["điểm", "score"]: 
         return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
         
@@ -281,7 +289,6 @@ def check_and_send_reminders_async():
         current_time = time.time()
         
         for user_id, state, last_study_time in docs:
-            # PostgreSQL lưu last_study_time là integer
             
             # Check if 1 hour passed and reminder hasn't been sent
             if (current_time - last_study_time) > REMINDER_INTERVAL_SECONDS and not state.get('reminder_sent', False):
@@ -291,7 +298,7 @@ def check_and_send_reminders_async():
                 
                 # Cập nhật cờ nhắc nhở trong DB
                 state['reminder_sent'] = True
-                save_user_state(user_id, state, update_time=False)
+                save_user_state(user_id, state, update_time=False) # update_time=False: CHỈ CẬP NHẬT FLAG
                 print(f"--> Sent reminder to user: {user_id}")
                 
     except Exception as e:
