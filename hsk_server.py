@@ -13,8 +13,8 @@ import time
 
 # --- CẤU HÌNH FIREBASE ---
 try:
-    # Ensure firebase_key.json is in the same directory on the Server
-    CRED = credentials.Certificate("firebase_key.json")
+    # ĐÃ SỬA: Tìm kiếm file 'firebase_admin.json' (tên file bạn đã cung cấp)
+    CRED = credentials.Certificate("firebase_admin.json")
     initialize_app(CRED)
     DB = firestore.client()
     print("--> Firebase Firestore connection successful!")
