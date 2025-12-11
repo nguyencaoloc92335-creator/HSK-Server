@@ -32,9 +32,12 @@ REMINDER_INTERVAL_SECONDS = 3600 # 1 hour = 3600 seconds
 try:
     import hsk2_vocabulary_full as hsk_data
     HSK_DATA: List[Dict[str, Any]] = hsk_data.HSK_DATA
+    # Tạo bản đồ từ Hán tự -> từ vựng để tra cứu nhanh
+    HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
     print(f"--> Successfully loaded {len(HSK_DATA)} vocabulary items.")
 except ImportError:
     HSK_DATA = [{"Hán tự": "你好", "Pinyin": "nǐhǎo", "Nghĩa": "xin chào", "Ví dụ": "你好吗", "Dịch câu": "Bạn khỏe không"}]
+    HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
 
 # Define Quiz Modes (Matching PC App logic)
 BOT_MODES = [
@@ -51,8 +54,16 @@ app = FastAPI()
 def get_user_state(user_id: str) -> Dict[str, Any]:
     """Retrieves user state from Firestore, or returns a default state."""
     default_state = {
-        "session_words": [], "mode_index": 0, "task_queue": [], "backup_queue": [],
-        "mistake_made": False, "current_task": None, "score": 0, "total_questions": 0,
+        # session_words: chỉ lưu Hán tự
+        "session_hanzi": [], 
+        "mode_index": 0, 
+        # task_queue: chỉ lưu Hán tự và mode_name
+        "task_queue": [], 
+        "backup_queue": [],
+        "mistake_made": False, 
+        # current_task: chỉ lưu Hán tự và mode_name
+        "current_task": None, 
+        "score": 0, "total_questions": 0,
         "last_study_time": 0, "reminder_sent": False
     }
     if DB:
@@ -79,8 +90,11 @@ def start_new_session_bot(user_id: str) -> str:
     state = get_user_state(user_id)
     session_words = random.sample(HSK_DATA, min(WORDS_PER_SESSION, len(HSK_DATA)))
     
+    # LƯU TRỮ CHỈ HÁN TỰ (để database ổn định)
+    state["session_hanzi"] = [word["Hán tự"] for word in session_words]
+    
     state.update({
-        "session_words": session_words, "mode_index": 0, "score": 0, "total_questions": 0
+        "mode_index": 0, "score": 0, "total_questions": 0
     })
     save_user_state(user_id, state)
     
@@ -99,10 +113,10 @@ def load_next_mode_bot(user_id: str) -> str:
 
     current_mode = BOT_MODES[state["mode_index"]]
     
-    # Thiết lập Task Queue cho Mode mới
+    # Thiết lập Task Queue (chỉ lưu Hán tự và mode_name)
     state["task_queue"] = []
-    for word in state["session_words"]:
-        state["task_queue"].append({"word": word, "mode_name": current_mode["name"]})
+    for hanzi in state["session_hanzi"]:
+        state["task_queue"].append({"hanzi": hanzi, "mode_name": current_mode["name"]})
         
     random.shuffle(state["task_queue"])
     state["backup_queue"] = list(state["task_queue"])
@@ -111,7 +125,6 @@ def load_next_mode_bot(user_id: str) -> str:
     save_user_state(user_id, state)
     
     # Trả về thông báo bắt đầu và câu hỏi đầu tiên
-    # Chú ý: load_next_mode_bot KHÔNG tự gọi get_next_question (đã fix lỗi đệ quy)
     return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id, is_new_mode=True)
 
 def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
@@ -149,7 +162,9 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
     
     save_user_state(user_id, state)
     
-    word = task["word"]
+    # Tra cứu thông tin từ vựng đầy đủ từ Hán tự
+    hanzi = task["hanzi"]
+    word = HSK_MAP.get(hanzi, HSK_DATA[0]) # Fallback nếu lỗi
     mode = task["mode_name"]
     remaining = len(state['task_queue']) + 1
     
@@ -171,7 +186,9 @@ def check_answer_bot(user_id: str, answer: str) -> str:
     state = get_user_state(user_id)
     if not state or not state["current_task"]: return "Xin lỗi, hình như chưa có câu hỏi nào. Gõ 'học' để bắt đầu nhé!"
 
-    word = state["current_task"]["word"]
+    # Tra cứu từ vựng đầy đủ từ Hán tự
+    hanzi = state["current_task"]["hanzi"]
+    word = HSK_MAP.get(hanzi, HSK_DATA[0])
     mode = state["current_task"]["mode_name"]
     is_correct = False
     
@@ -223,7 +240,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
 
     # 1. Xử lý lệnh TIẾP TỤC (Chuyển mode)
     if user_text in ["tiếp tục"]:
-        # Chỉ cho phép tiếp tục khi task_queue rỗng (chờ chuyển mode)
+        # Chỉ cho phép tiếp tục khi current_task rỗng VÀ task_queue rỗng (chờ chuyển mode)
         if state["current_task"] is None and not state["task_queue"]:
             return load_next_mode_bot(user_id)
         else:
@@ -239,7 +256,17 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     
     # 4. Lệnh khác
     elif user_text in ["bỏ qua", "skip", "dap an"]:
-        return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
+        # Cần phải thực hiện việc bỏ qua ở đây thay vì trả lời 'Bạn chưa bắt đầu học'
+        if state["current_task"] is not None:
+            # Nếu có câu hỏi đang chạy, thực hiện logic bỏ qua
+            state["mistake_made"] = True
+            hanzi = state["current_task"]["hanzi"]
+            word = HSK_MAP.get(hanzi, HSK_DATA[0])
+            next_question = get_next_question(user_id)
+            return (f"⏩ Bỏ qua\nĐáp án là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\n\n") + next_question
+        else:
+            # Nếu không có câu hỏi nào
+            return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
             
     elif user_text in ["điểm", "score"]: 
         return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
