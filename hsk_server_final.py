@@ -18,7 +18,7 @@ import psycopg2
 from psycopg2 import pool
 import google.generativeai as genai
 
-# --- 0. CẤU HÌNH LOGGING ---
+# --- 0. CẤU HÌNH LOGGING CHI TIẾT ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,14 @@ except ImportError:
     HSK_DATA = [{"Hán tự": "你好", "Pinyin": "nǐhǎo", "Nghĩa": "xin chào", "Ví dụ": "你好!", "Ví dụ Pinyin": "Nǐ hǎo!", "Dịch câu": "Chào bạn!"}]
     HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
 
-# --- 3. DATABASE POOL ---
+# --- 3. DATABASE POOL (THÊM TIMEOUT) ---
 db_pool = None
 if DATABASE_URL:
     try:
-        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+        # Thêm connect_timeout để không bị treo mãi mãi nếu DB ngủ
+        db_pool = psycopg2.pool.ThreadedConnectionPool(
+            1, 10, DATABASE_URL, sslmode='require', connect_timeout=5
+        )
         logger.info("--> [DB] Connection Pool OK.")
     except Exception as e:
         logger.error(f"--> [DB ERROR] {e}")
@@ -65,15 +68,27 @@ app = FastAPI()
 # --- 4. STATE MANAGEMENT ---
 
 def get_db_conn():
-    return db_pool.getconn() if db_pool else None
+    if db_pool:
+        try:
+            return db_pool.getconn()
+        except Exception as e:
+            logger.error(f"Lỗi lấy kết nối DB: {e}")
+            return None
+    return None
 
 def release_db_conn(conn):
-    if db_pool and conn: db_pool.putconn(conn)
+    if db_pool and conn:
+        try:
+            db_pool.putconn(conn)
+        except:
+            pass
 
 def get_user_state(user_id: str) -> Dict[str, Any]:
+    logger.info(f"--- [STEP 1] Lấy trạng thái user: {user_id}")
+    
     default_state = {
         "user_id": user_id,
-        "mode": "IDLE",            # IDLE, AUTO_LEARNING, QUIZ
+        "mode": "IDLE",            
         "session_words": [],       
         "learned_history": [],     
         "current_index": 0,        
@@ -81,62 +96,73 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
         "current_quiz_word": None, 
         "quiz_type": None,
         "quiz_options": {},
-        "next_action_time": 0,     # QUAN TRỌNG: Thời điểm sẽ gửi tin nhắn tiếp theo
-        "waiting_confirm": False,  # True: Đang đợi user nhắn "Hiểu"
-        "reminder_count": 0        # Đếm số lần nhắc nếu user quên trả lời
+        "next_action_time": 0,     
+        "waiting_confirm": False,  
+        "reminder_count": 0        
     }
 
+    # 1. Ưu tiên Cache
     if user_id in USER_CACHE:
+        logger.info(f"--- [STEP 1.1] Tìm thấy trong Cache")
         merged = default_state.copy()
         merged.update(USER_CACHE[user_id])
         return merged
 
+    # 2. Tìm DB
     if db_pool:
+        logger.info(f"--- [STEP 1.2] Đọc từ DB...")
         conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, state JSONB);")
-                cur.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
-                res = cur.fetchone()
-                if res:
-                    db_data = res[0]
-                    final_state = default_state.copy()
-                    final_state.update(db_data if isinstance(db_data, dict) else {})
-                    USER_CACHE[user_id] = final_state
-                    return final_state
-        except Exception as e:
-            logger.error(f"DB Read Error: {e}")
-        finally:
-            release_db_conn(conn)
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, state JSONB);")
+                    cur.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
+                    res = cur.fetchone()
+                    if res:
+                        logger.info(f"--- [STEP 1.3] Đã lấy dữ liệu từ DB")
+                        db_data = res[0]
+                        final_state = default_state.copy()
+                        final_state.update(db_data if isinstance(db_data, dict) else {})
+                        USER_CACHE[user_id] = final_state
+                        return final_state
+            except Exception as e:
+                logger.error(f"DB Read Error: {e}")
+            finally:
+                release_db_conn(conn)
+        else:
+            logger.warning("Không lấy được kết nối DB, dùng bộ nhớ tạm.")
     
+    logger.info(f"--- [STEP 1.4] Tạo mới user state")
     return default_state
 
 def save_user_state(user_id: str, state: Dict[str, Any]):
     USER_CACHE[user_id] = state 
     if db_pool:
         conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO users (user_id, state) VALUES (%s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state
-                """, (user_id, json.dumps(state)))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"DB Save Error: {e}")
-        finally:
-            release_db_conn(conn)
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO users (user_id, state) VALUES (%s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state
+                    """, (user_id, json.dumps(state)))
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"DB Save Error: {e}")
+            finally:
+                release_db_conn(conn)
 
 def reset_user_state(user_id: str):
     if user_id in USER_CACHE: del USER_CACHE[user_id]
     if db_pool:
         conn = get_db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
-                conn.commit()
-        except Exception: pass
-        finally: release_db_conn(conn)
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                    conn.commit()
+            except Exception: pass
+            finally: release_db_conn(conn)
 
 def clear_learning_history(user_id: str, state: Dict[str, Any]):
     state["learned_history"] = []
@@ -149,13 +175,14 @@ def clear_learning_history(user_id: str, state: Dict[str, Any]):
 # --- 5. AI & HELPERS ---
 
 def ai_chat_chit(message: str) -> str:
+    logger.info(f"--- [AI] Đang gọi Gemini chat chit: {message}")
     try:
-        prompt = f"Bạn là trợ lý HSK. User nói: '{message}'. Trả lời ngắn gọn, nhắc họ gõ 'Bắt đầu' để vào chế độ học tự động. Nếu họ hỏi tiến độ, nhắc họ gõ 'Tiến độ'."
+        prompt = f"Bạn là trợ lý HSK. User nói: '{message}'. Trả lời ngắn gọn, nhắc họ gõ 'Bắt đầu' để vào chế độ học tự động."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return "Chào bạn! Gõ 'Bắt đầu' để học, hoặc 'Hướng dẫn' để xem cách dùng nhé! 😄"
+        return "Chào bạn! Gõ 'Bắt đầu' để học nhé! 😄"
 
 def ai_generate_example_smart(word_data: dict) -> dict:
     hanzi = word_data.get('Hán tự', '')
@@ -180,18 +207,19 @@ def ai_generate_example_smart(word_data: dict) -> dict:
         return backup
 
 def send_fb_message(user_id: str, text: str):
-    logger.info(f"Đang gửi tin nhắn tới {user_id}: {text[:50]}...")
+    logger.info(f"--- [FB SEND] Đang gửi tới {user_id}: {text[:30]}...")
     params = {"access_token": PAGE_ACCESS_TOKEN}
     headers = {"Content-Type": "application/json"}
     data = {"recipient": {"id": user_id}, "message": {"text": text}}
     try:
-        r = requests.post("https://graph.facebook.com/v16.0/me/messages", params=params, headers=headers, json=data)
+        # THÊM TIMEOUT 10s ĐỂ KHÔNG BỊ TREO
+        r = requests.post("https://graph.facebook.com/v16.0/me/messages", params=params, headers=headers, json=data, timeout=10)
         if r.status_code != 200:
-            logger.error(f"❌ FB GỬI LỖI (Status {r.status_code}): {r.text}")
+            logger.error(f"❌ LỖI GỬI FB: {r.status_code} - {r.text}")
         else:
-            logger.info("✅ Gửi tin nhắn thành công.")
+            logger.info("✅ Gửi FB thành công.")
     except Exception as e:
-        logger.error(f"❌ FB REQUEST ERROR: {e}")
+        logger.error(f"❌ LỖI KẾT NỐI FB: {e}")
 
 def get_vietnam_time():
     return datetime.now(timezone(timedelta(hours=7)))
@@ -205,7 +233,7 @@ def send_guide_message(user_id: str):
         "   - Đủ 6 từ sẽ kiểm tra.\n\n"
         "2️⃣ **Tiện ích:**\n"
         "   - `Tiến độ`: Xem số từ đã học.\n"
-        "   - `Bao lâu`: Xem thời gian còn lại đến từ mới.\n"
+        "   - `Bao lâu`: Xem thời gian còn lại.\n"
         "   - `Chào buổi sáng`: Học tiếp tiến độ cũ.\n"
         "   - `Học lại`: Xóa lịch sử.\n"
         "   - `Dừng`: Nghỉ ngơi.\n\n"
@@ -217,9 +245,11 @@ def send_guide_message(user_id: str):
 
 def process_message_background(user_id: str, message_text: str):
     try:
-        logger.info(f"Processing msg from {user_id}: {message_text}")
+        logger.info(f"========== BẮT ĐẦU XỬ LÝ: {message_text} ==========")
         state = get_user_state(user_id)
         msg = message_text.strip().lower()
+
+        logger.info(f"--- [LOGIC] Mode hiện tại: {state.get('mode')}")
 
         # --- NHÓM LỆNH HỆ THỐNG ---
         if any(cmd in msg for cmd in ['hướng dẫn', 'huong dan', 'help', 'giới thiệu', 'menu']):
@@ -277,7 +307,6 @@ def process_message_background(user_id: str, message_text: str):
         if any(keyword in msg for keyword in ['chào buổi sáng', 'buổi sáng', 'good morning', 'morning', 'dậy rồi']):
             send_fb_message(user_id, "🌞 Chào buổi sáng! Tiếp tục học nào! 🚀")
             state["mode"] = "AUTO_LEARNING"
-            # Reset để gửi ngay lập tức
             state["next_action_time"] = int(time.time())
             state["waiting_confirm"] = False
             save_user_state(user_id, state)
@@ -297,6 +326,7 @@ def process_message_background(user_id: str, message_text: str):
         mode = state.get("mode", "IDLE")
 
         if mode == "IDLE":
+            logger.info("--- [LOGIC] Vào mode IDLE -> Gọi AI")
             reply = ai_chat_chit(message_text)
             send_fb_message(user_id, reply)
 
@@ -306,14 +336,12 @@ def process_message_background(user_id: str, message_text: str):
                 send_fb_message(user_id, "🌙 Giờ đi ngủ (0h-6h). Mai học tiếp nhé!")
                 return
 
-            # LOGIC XÁC NHẬN HIỂU
             if state.get("waiting_confirm", False):
                 if any(w in msg for w in ["hiểu", "ok", "rồi", "yes", "tiếp", "đã xem", "ok bot"]):
                     next_time = int(time.time()) + 600
                     state["next_action_time"] = next_time
                     state["waiting_confirm"] = False 
                     state["reminder_count"] = 0
-                    
                     send_fb_message(user_id, f"Tuyệt vời! 👍 Đồng hồ đã chạy. 10 phút nữa mình sẽ gửi từ tiếp theo.")
                     save_user_state(user_id, state)
                 else:
@@ -323,7 +351,6 @@ def process_message_background(user_id: str, message_text: str):
                     state["next_action_time"] = int(time.time()) 
                     save_user_state(user_id, state)
                 else:
-                    # Nếu hỏi linh tinh khi đang chờ giờ
                     remain = state.get("next_action_time", 0) - int(time.time())
                     if remain > 0:
                         minutes = remain // 60
@@ -333,7 +360,7 @@ def process_message_background(user_id: str, message_text: str):
             check_quiz_answer(user_id, state, message_text)
             
     except Exception as e:
-        logger.error(f"FATAL ERROR in logic: {e}")
+        logger.error(f"❌ FATAL ERROR in logic: {e}")
 
 def start_auto_learning(user_id, state):
     state["mode"] = "AUTO_LEARNING"
@@ -557,8 +584,12 @@ async def webhook(request: Request, bg_tasks: BackgroundTasks):
                     if 'message' in m:
                         sender_id = m['sender']['id']
                         text = m['message'].get('text', '')
+                        # Bỏ qua tin nhắn không có text (ví dụ sticker) để tránh lỗi
                         if text:
                             bg_tasks.add_task(process_message_background, sender_id, text)
+                        else:
+                            logger.info(f"Bỏ qua tin nhắn không phải text từ {sender_id}")
+                            
         return PlainTextResponse("EVENT_RECEIVED")
     except Exception as e:
         logger.error(f"WEBHOOK ERROR: {e}")
