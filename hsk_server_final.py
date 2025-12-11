@@ -97,7 +97,6 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
                         return default_state
         except Exception as e:
             print(f"LỖI POSTGRESQL KHI ĐỌC: {e}. Sử dụng trạng thái mặc định.")
-            # Quan trọng: Nếu DB lỗi, phải trả về default_state để Bot không crash
             return default_state
     return default_state
 
@@ -121,7 +120,7 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
                 conn.commit()
             
         except Exception as e:
-            print(f"LỖI POSTGRESQL KHI GHI: {e}. Dữ liệu không được lưu.")
+            print(f"LỖỖI POSTGRESQL KHI GHI: {e}. Dữ liệu không được lưu.")
             
 # --- BOT QUIZ LOGIC (FIXED) ---
 
@@ -356,7 +355,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     
     # --- 1. Xử lý lệnh HƯỚNG DẪN / HELP ---
     if user_text in ["hướng dẫn", "help", "menu"]:
-        return (
+        guide_text = (
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
             f"1. GIAI ĐOẠN HỌC (PREVIEW):\n"
             f"   Lệnh: `học` / `learn`\n"
@@ -372,6 +371,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
             f"   - Gõ: `bỏ qua` / `skip`: Xem đáp án câu hiện tại (chỉ dùng trong QUIZ).\n"
             f"   - Gõ: `điểm` / `score`: Xem thống kê kết quả hiện tại.\n"
         )
+        return guide_text
     
     # --- 2. Xử lý lệnh RESET (XÓA TOÀN BỘ) ---
     if user_text in ["reset", "clear", "xóa"]:
@@ -425,9 +425,10 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     elif user_text in ["điểm", "score"]: 
         return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
         
-    # --- 9. Mặc định/Trạng thái IDLE ---
+    # --- 9. Mặc định/Lệnh không hợp lệ (Hiển thị Hướng dẫn) ---
     else: 
-        return "Chào bạn! Gõ `học` hoặc `learn` để bắt đầu ôn tập nhanh.\n(Gõ `hướng dẫn` hoặc `help` để xem thêm các lệnh)."
+        # Nếu Bot không nhận ra lệnh, hiển thị lại Hướng dẫn đầy đủ
+        return process_chat_logic(user_id, "hướng dẫn")
 
 
 # --- REMINDER LOGIC ---
