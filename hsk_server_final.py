@@ -13,7 +13,9 @@ import time
 
 # --- CẤU HÌNH FIREBASE ---
 try:
-    # ĐÃ SỬA: Tìm kiếm file 'firebase_admin.json' (tên file bạn đã cung cấp)
+    # SỬ DỤNG TÊN FILE CHÌA KHÓA ĐÃ ĐƯỢC XÁC NHẬN
+    # LƯU Ý: LỖI INVALID JWT SIGNATURE CHO THẤY CHÌA KHÓA NÀY ĐÃ HẾT HẠN. 
+    # BẠN PHẢI TẢI XUỐNG MỘT FILE firebase_admin.json MỚI HOÀN TOÀN TỪ FIREBASE.
     CRED = credentials.Certificate("firebase_admin.json")
     initialize_app(CRED)
     DB = firestore.client()
@@ -54,14 +56,11 @@ app = FastAPI()
 def get_user_state(user_id: str) -> Dict[str, Any]:
     """Retrieves user state from Firestore, or returns a default state."""
     default_state = {
-        # session_words: chỉ lưu Hán tự
         "session_hanzi": [], 
         "mode_index": 0, 
-        # task_queue: chỉ lưu Hán tự và mode_name
         "task_queue": [], 
         "backup_queue": [],
         "mistake_made": False, 
-        # current_task: chỉ lưu Hán tự và mode_name
         "current_task": None, 
         "score": 0, "total_questions": 0,
         "last_study_time": 0, "reminder_sent": False
@@ -362,4 +361,4 @@ def send_facebook_message(recipient_id, text):
 if __name__ == "__main__":
     print("Đang khởi động Server HSK...")
     # SỬA LỖI: Đảm bảo chạy đúng module name
-    uvicorn.run("hsk_server:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("hsk_server_final:app", host="127.0.0.1", port=8000, reload=True)
