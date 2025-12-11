@@ -111,6 +111,7 @@ def load_next_mode_bot(user_id: str) -> str:
     save_user_state(user_id, state)
     
     # Trả về thông báo bắt đầu và câu hỏi đầu tiên
+    # Chú ý: load_next_mode_bot KHÔNG tự gọi get_next_question (đã fix lỗi đệ quy)
     return f"🌟 BẮT ĐẦU DẠNG {state['mode_index'] + 1}: {current_mode['title']}\n\n" + get_next_question(user_id, is_new_mode=True)
 
 def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
@@ -127,16 +128,16 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
             save_user_state(user_id, state)
             return "❌ BẠN ĐÃ SAI!\nLàm lại Dạng này cho đến khi đúng hết 100% nhé.\n\n" + get_next_question(user_id)
         else:
-            # Đúng 100% -> Tăng Mode Index và trả về Lệnh chuyển Mode
+            # Đúng 100% -> Tăng Mode Index và YÊU CẦU xác nhận chuyển Mode
             state["mode_index"] += 1
+            state["current_task"] = None # Rất quan trọng để Bot dừng lại
             save_user_state(user_id, state)
             
-            # Kiểm tra xem có kết thúc luôn không
+            # Gửi thông báo hoàn thành và yêu cầu xác nhận tiếp tục
             if state["mode_index"] >= len(BOT_MODES):
-                return load_next_mode_bot(user_id)
+                return load_next_mode_bot(user_id) # Kết thúc
             else:
-                # Nếu chưa kết thúc, trả về thông báo hoàn thành Mode và chạy Mode tiếp theo
-                return "✅ HOÀN THÀNH DẠNG BÀI!\n\n" + load_next_mode_bot(user_id)
+                return f"✅ HOÀN THÀNH DẠNG BÀI {state['mode_index']}/{len(BOT_MODES)}!\n\nGõ `tiếp tục` để bắt đầu Dạng bài mới nhé."
             
     # 2. Lấy task tiếp theo
     task = state["task_queue"].pop(0)
@@ -192,6 +193,7 @@ def check_answer_bot(user_id: str, answer: str) -> str:
         feedback = (f"❌ SAI RỒI!\nĐáp án đúng là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\nCâu mẫu: {word['Ví dụ']}")
     
     save_user_state(user_id, state)
+    # Sau khi trả lời xong, lấy câu hỏi tiếp theo
     return feedback + "\n\n" + get_next_question(user_id)
 
 def process_chat_logic(user_id: str, user_text: str) -> str:
@@ -206,32 +208,44 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
             f"1. Bắt đầu phiên học:\n"
             f"   Gõ: `học` hoặc `bắt đầu`\n"
             f"   -> Bot sẽ chọn ngẫu nhiên 10 từ và bắt đầu Dạng 1.\n\n"
-            f"2. Chế độ học tập:\n"
+            f"2. Tiếp tục Dạng bài:\n"
+            f"   Gõ: `tiếp tục`\n"
+            f"   -> Dùng khi Bot yêu cầu xác nhận để chuyển sang Dạng bài mới.\n\n"
+            f"3. Chế độ học tập:\n"
             f"   Bot sẽ đố bạn qua 4 Dạng bài liên tục, giống hệt App PC.\n"
             f"   *Lưu ý: Bạn phải trả lời đúng 100% (Perfect Run) mới qua được Dạng tiếp theo!*\n\n"
-            f"3. Các lệnh trong khi học:\n"
+            f"4. Các lệnh trong khi học:\n"
             f"   - Gõ: `bỏ qua` hoặc `dap an`: Xem đáp án và chuyển sang câu mới.\n"
             f"   - Gõ: `điểm` hoặc `score`: Xem thống kê kết quả hiện tại.\n\n"
-            f"4. Nhắc nhở:\n"
+            f"5. Nhắc nhở:\n"
             f"   - Bot sẽ tự động nhắn tin nhắc nhở bạn sau mỗi 1 tiếng nếu bạn không tương tác."
         )
 
-    # 1. Trả lời câu hỏi (chạy trước để ưu tiên trả lời)
+    # 1. Xử lý lệnh TIẾP TỤC (Chuyển mode)
+    if user_text in ["tiếp tục"]:
+        # Chỉ cho phép tiếp tục khi task_queue rỗng (chờ chuyển mode)
+        if state["current_task"] is None and not state["task_queue"]:
+            return load_next_mode_bot(user_id)
+        else:
+            return "Bạn đang học dở, hãy trả lời câu hỏi hiện tại trước."
+            
+    # 2. Trả lời câu hỏi (chạy trước để ưu tiên trả lời)
     if state["current_task"] is not None:
         return check_answer_bot(user_id, user_text)
     
-    # 2. Logic bắt đầu (chỉ chạy khi không có câu hỏi nào đang chờ)
+    # 3. Logic bắt đầu (chỉ chạy khi không có câu hỏi nào đang chờ)
     if user_text in ["học", "bắt đầu", "start"]: 
         return start_new_session_bot(user_id)
     
-    # 3. Lệnh khác
+    # 4. Lệnh khác
     elif user_text in ["bỏ qua", "skip", "dap an"]:
-        # Xử lý bỏ qua (khi không có task)
         return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
             
-    elif user_text in ["điểm", "score"]: return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
+    elif user_text in ["điểm", "score"]: 
+        return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
         
-    else: return "Chào bạn! Gõ 'học' để bắt đầu ôn tập nhanh.\n(Gõ 'điểm' hoặc 'hướng dẫn' để xem thêm)."
+    else: 
+        return "Chào bạn! Gõ 'học' để bắt đầu ôn tập nhanh.\n(Gõ 'điểm' hoặc 'hướng dẫn' để xem thêm)."
 
 
 # --- REMINDER LOGIC ---
