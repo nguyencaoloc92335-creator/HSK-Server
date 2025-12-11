@@ -38,7 +38,7 @@ else:
         DB = None 
 
 # --- FACEBOOK CONFIGURATION (MANDATORY) ---
-PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQCSLHPqo2Y2HfW8GvdyfPc6oOCqVb8X61h6HadIILwTn7uDkZAIqgdEKEDMDFmhNYfoPVSevT907qEpFE5OYZC9VtfEwyR1uZA3b49k5VlBVZAPpfmsFqURLl5Pn0P4LZAaxWMzhuHmEhJeZB6Gq1NXeZAxQ3dp940k3P2VMJmjorafaFWeiAvU7YtOZCgZDZD"
+PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQCSLHPqo2Y2HfW8GvdyfPc6oOCqVb8X61h6HadIILwTn7uDkZAIqgdEKEDMDFmhNYfoPVSevT907qEpFE5OYZC9VtfEwyR1uZA3b49k5VlBVZAPpfmsFqURLl5Pn0H4LZAaxWMzhuHmEhJeZB6Gq1NXeZAxQ3dp940k3P2VMJmjorafaFWeiAvU7YtOZCgZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat" 
 WORDS_PER_SESSION = 10 
 REMINDER_INTERVAL_SECONDS = 3600 # 1 hour = 3600 seconds
@@ -89,8 +89,10 @@ def get_user_state(user_id: str) -> Dict[str, Any]:
             CURSOR.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
             result = CURSOR.fetchone()
             if result:
-                # PostgreSQL JSONB column returns a Python dict
-                return result[0]
+                loaded_state = result[0]
+                # FIX KeyError: Merging loaded state with default state to ensure all keys exist
+                final_state = {**default_state, **loaded_state}
+                return final_state
             else:
                 # Insert default state if user not found
                 save_user_state(user_id, default_state, update_time=False)
@@ -124,7 +126,7 @@ def save_user_state(user_id: str, state: Dict[str, Any], update_time: bool = Tru
 # --- BOT QUIZ LOGIC (FIXED) ---
 
 def start_learning_phase(user_id: str) -> str:
-    """[LỆNH: HỌC] Chọn 10 từ mới và bắt đầu giai đoạn Preview."""
+    """[LỆNH: HỌC / LEARN] Chọn 10 từ mới và bắt đầu giai đoạn Preview."""
     state = get_user_state(user_id)
     
     available_hanzi = [h for h in ALL_HANZI if h not in state["learned_hanzi"]]
@@ -166,7 +168,7 @@ def show_next_preview_word(user_id: str) -> str:
         return (
             f"✅ HOÀN TẤT GIAI ĐOẠN HỌC!\n\n"
             f"Bạn đã xem hết {WORDS_PER_SESSION} từ mới. "
-            f"Gõ `bắt đầu` để chuyển sang chế độ kiểm tra Perfect Run."
+            f"Gõ `bắt đầu` hoặc `start` để chuyển sang chế độ kiểm tra Perfect Run."
         )
 
     hanzi_to_show = state["preview_queue"].pop(0)
@@ -182,11 +184,11 @@ def show_next_preview_word(user_id: str) -> str:
         f"🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n"
         f"🇻🇳 Nghĩa: {word['Nghĩa']}\n"
         f"Ví dụ: {word['Ví dụ']}\n"
-        f"Gõ `tiếp tục` để xem từ tiếp theo, hoặc gõ `bắt đầu` để vào bài kiểm tra."
+        f"Gõ `tiếp tục` hoặc `continue` để xem từ tiếp theo, hoặc gõ `bắt đầu` để vào bài kiểm tra."
     )
 
 def start_quiz_phase(user_id: str) -> str:
-    """[LỆNH: BẮT ĐẦU] Bắt đầu giai đoạn Quizzing (Dạng 1)."""
+    """[LỆNH: BẮT ĐẦU / START] Bắt đầu giai đoạn Quizzing (Dạng 1)."""
     state = get_user_state(user_id)
     
     state["current_phase"] = "QUIZ"
@@ -202,7 +204,7 @@ def load_next_mode_bot(user_id: str) -> str:
     state = get_user_state(user_id)
     
     if state["current_phase"] != "QUIZ":
-        return "Bot bị lỗi trạng thái. Gõ `học` để bắt đầu lại phiên mới."
+        return "Bot bị lỗi trạng thái. Gõ `học` hoặc `learn` để bắt đầu lại phiên mới."
     
     if state["mode_index"] >= len(BOT_MODES):
         # KẾT THÚC VÀ LƯU TỪ VỰNG ĐÃ HỌC/KIỂM TRA
@@ -216,7 +218,7 @@ def load_next_mode_bot(user_id: str) -> str:
         
         return (
             f"🎉 CHÚC MỪNG! Bạn đã hoàn thành TẤT CẢ các Dạng bài!\n"
-            f"Tiến độ đã được lưu lại. Gõ `học` để bắt đầu phiên mới với 10 từ khác."
+            f"Tiến độ đã được lưu lại. Gõ `học` hoặc `learn` để bắt đầu phiên mới với 10 từ khác."
         )
 
     current_mode = BOT_MODES[state["mode_index"]]
@@ -257,7 +259,7 @@ def get_next_question(user_id: str, is_new_mode: bool = False) -> str:
             if state["mode_index"] >= len(BOT_MODES):
                 return load_next_mode_bot(user_id) # Kết thúc (Hàm này sẽ trả về thông báo kết thúc)
             else:
-                return f"✅ HOÀN THÀNH DẠNG BÀI {state['mode_index']}/{len(BOT_MODES)}!\n\nGõ `tiếp tục` để bắt đầu Dạng bài mới nhé."
+                return f"✅ HOÀN THÀNH DẠNG BÀI {state['mode_index']}/{len(BOT_MODES)}!\n\nGõ `tiếp tục` hoặc `continue` để bắt đầu Dạng bài mới nhé."
             
     # 2. Lấy task tiếp theo
     task = state["task_queue"].pop(0)
@@ -291,9 +293,9 @@ def check_answer_bot(user_id: str, answer: str) -> str:
     """Checks the user's answer and saves state."""
     state = get_user_state(user_id)
     if state["current_phase"] != "QUIZ":
-        return "Gõ `bắt đầu` để chuyển sang chế độ kiểm tra sau khi học xong."
+        return "Gõ `bắt đầu` hoặc `start` để chuyển sang chế độ kiểm tra sau khi học xong."
         
-    if not state or not state["current_task"]: return "Xin lỗi, hình như chưa có câu hỏi nào. Gõ 'học' để bắt đầu nhé!"
+    if not state or not state["current_task"]: return "Xin lỗi, hình như chưa có câu hỏi nào. Gõ `học` hoặc `learn` để bắt đầu nhé!"
 
     # Tra cứu từ vựng đầy đủ từ Hán tự
     hanzi = state["current_task"]["hanzi"]
@@ -326,37 +328,37 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     user_text = user_text.lower().strip()
     state = get_user_state(user_id)
     
-    # --- 1. Xử lý lệnh HƯỚNG DẪN / MENU ---
+    # --- 1. Xử lý lệnh HƯỚNG DẪN / HELP ---
     if user_text in ["hướng dẫn", "help", "menu"]:
         return (
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
             f"1. GIAI ĐOẠN HỌC (PREVIEW):\n"
-            f"   Lệnh: `học`\n"
+            f"   Lệnh: `học` / `learn`\n"
             f"   -> Chọn 10 từ ngẫu nhiên và hiển thị đầy đủ thông tin để bạn học. Các từ này chưa từng được học trước đó.\n\n"
             f"2. GIAI ĐOẠN KIỂM TRA (QUIZ):\n"
-            f"   Lệnh: `bắt đầu`\n"
+            f"   Lệnh: `bắt đầu` / `start`\n"
             f"   -> Bắt đầu bài kiểm tra 4 Dạng bài với 10 từ bạn vừa học.\n\n"
             f"3. LỆNH TRONG KHI HỌC:\n"
-            f"   - Gõ: `tiếp tục` (Trong PREVIEW: Xem từ tiếp theo. Trong QUIZ: Bắt đầu Dạng bài mới).\n"
-            f"   - Gõ: `bỏ qua` / `dap an`: Xem đáp án câu hiện tại (chỉ dùng trong QUIZ).\n"
-            f"   - Gõ: `điểm`: Xem thống kê kết quả hiện tại.\n"
+            f"   - Gõ: `tiếp tục` / `continue` (Trong PREVIEW: Xem từ tiếp theo. Trong QUIZ: Bắt đầu Dạng bài mới).\n"
+            f"   - Gõ: `bỏ qua` / `skip`: Xem đáp án câu hiện tại (chỉ dùng trong QUIZ).\n"
+            f"   - Gõ: `điểm` / `score`: Xem thống kê kết quả hiện tại.\n"
         )
     
     # --- 2. Xử lý lệnh BẮT ĐẦU HỌC (PREVIEW) ---
-    if user_text in ["học"]: 
+    if user_text in ["học", "learn"]: 
         return start_learning_phase(user_id)
 
     # --- 3. Xử lý lệnh BẮT ĐẦU KIỂM TRA (QUIZ) ---
-    if user_text in ["bắt đầu"]: 
+    if user_text in ["bắt đầu", "start"]: 
         if state["current_phase"] == "QUIZ":
             return "Bạn đang trong bài kiểm tra rồi! Hãy trả lời câu hỏi hiện tại."
         if not state["session_hanzi"]:
-            return "Bạn chưa chọn từ để học. Gõ `học` để bắt đầu phiên mới."
+            return "Bạn chưa chọn từ để học. Gõ `học` hoặc `learn` để bắt đầu phiên mới."
         
         return start_quiz_phase(user_id)
 
     # --- 4. Xử lý lệnh TIẾP TỤC ---
-    if user_text in ["tiếp tục"]:
+    if user_text in ["tiếp tục", "continue"]:
         if state["current_phase"] == "PREVIEW":
             return show_next_preview_word(user_id)
         
@@ -392,7 +394,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
         
     # --- 8. Mặc định/Trạng thái IDLE ---
     else: 
-        return "Chào bạn! Gõ `học` để bắt đầu ôn tập nhanh.\n(Gõ `hướng dẫn` để xem thêm các lệnh)."
+        return "Chào bạn! Gõ `học` hoặc `learn` để bắt đầu ôn tập nhanh.\n(Gõ `hướng dẫn` hoặc `help` để xem thêm các lệnh)."
 
 
 # --- REMINDER LOGIC ---
