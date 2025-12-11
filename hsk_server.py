@@ -19,7 +19,7 @@ try:
     DB = firestore.client()
     print("--> Firebase Firestore connection successful!")
 except Exception as e:
-    print(f"--> FIREBASE CONNECTION ERROR: {e}. Data will not be saved.")
+    print(f"--> FIREBASE CONNECTION ERROR: {e}. Dữ liệu sẽ không được lưu.")
     DB = None 
 
 # --- FACEBOOK CONFIGURATION (MANDATORY) ---
@@ -180,7 +180,7 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
     user_text = user_text.lower().strip()
     state = get_user_state(user_id)
     
-    # NEW: Hướng dẫn
+    # Hướng dẫn
     if user_text in ["hướng dẫn", "help", "menu"]:
         return (
             f"📚 HƯỚNG DẪN SỬ DỤNG HSK BOT\n\n"
@@ -197,18 +197,20 @@ def process_chat_logic(user_id: str, user_text: str) -> str:
             f"   - Bot sẽ tự động nhắn tin nhắc nhở bạn sau mỗi 1 tiếng nếu bạn không tương tác."
         )
 
-    if user_text in ["học", "bắt đầu", "start"]: return start_new_session_bot(user_id)
+    # 1. Trả lời câu hỏi (chạy trước để ưu tiên trả lời)
+    if state["current_task"] is not None:
+        return check_answer_bot(user_id, user_text)
     
+    # 2. Logic bắt đầu (chỉ chạy khi không có câu hỏi nào đang chờ)
+    if user_text in ["học", "bắt đầu", "start"]: 
+        return start_new_session_bot(user_id)
+    
+    # 3. Lệnh khác
     elif user_text in ["bỏ qua", "skip", "dap an"]:
-        if not state["current_task"]: return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
-        state["mistake_made"] = True
-        word = state["current_task"]["word"]
-        next_question = get_next_question(user_id)
-        return (f"⏩ Bỏ qua\nĐáp án là: 🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n🇻🇳 Nghĩa: {word['Nghĩa']}\n\n") + next_question
+        # Lỗi: Không có task nào để bỏ qua
+        return "Bạn chưa bắt đầu học. Gõ 'học' để nhận câu hỏi."
             
     elif user_text in ["điểm", "score"]: return f"📊 KẾT QUẢ HIỆN TẠI:\n\nĐúng: {state['score']}/{state['total_questions']}. Tiếp tục làm bài nhé!"
-        
-    elif state["current_task"] is not None: return check_answer_bot(user_id, user_text)
         
     else: return "Chào bạn! Gõ 'học' để bắt đầu ôn tập nhanh.\n(Gõ 'điểm' hoặc 'hướng dẫn' để xem thêm)."
 
@@ -299,4 +301,5 @@ def send_facebook_message(recipient_id, text):
 
 if __name__ == "__main__":
     print("Đang khởi động Server HSK...")
-    uvicorn.run("hsk_server_v2:app", host="127.0.0.1", port=8000, reload=True)
+    # SỬA LỖI: Đảm bảo chạy đúng module name
+    uvicorn.run("hsk_server_test:app", host="127.0.0.1", port=8000, reload=True)
