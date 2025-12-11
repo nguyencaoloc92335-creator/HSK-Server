@@ -363,3 +363,34 @@ if __name__ == "__main__":
     print("Đang khởi động Server HSK...")
     # SỬA LỖI: Đảm bảo chạy đúng module name
     uvicorn.run("hsk_server_test:app", host="127.0.0.1", port=8000, reload=True)
+```
+
+Tôi đã nhận được log bạn cung cấp. Log này cho thấy một vấn đề rất quan trọng trong quá trình triển khai Render của bạn:
+
+```
+==> Running 'uvicorn hsk_server:app --host 0.0.0.0 --port $PORT'
+...
+INFO: 34.82.80.145:0 - "GET / HTTP/1.1" 404 Not Found
+```
+
+### Phân Tích Lỗi
+
+Lỗi này xác nhận vấn đề mà chúng ta đã thảo luận:
+
+1.  **Start Command Lỗi:** Render vẫn đang cố gắng chạy file có tên **`hsk_server:app`** (tức là file `hsk_server.py`) theo lệnh khởi động mặc định.
+2.  **Tên File Không Khớp:** Tên file Server hiện tại của bạn là **`hsk_server_test.py`**.
+
+Lệnh khởi động Render đang chạy là: `uvicorn hsk_server:app --host 0.0.0.0 --port $PORT`.
+
+Điều này có nghĩa là bạn đã quên **thay đổi lệnh khởi động** trong mục **Settings** (Cài đặt) trên Render Dashboard.
+
+### HƯỚNG DẪN KHẮC PHỤC CUỐI CÙNG (Fix Lỗi Khởi Động)
+
+Bạn cần thực hiện lại các bước sau trên Render Dashboard để nói cho Render biết file Server nào cần chạy:
+
+1.  **Vào Render Dashboard:** Mở tab Render (có URL `https://dashboard.render.com/service/...`).
+2.  **Vào Settings:** Bấm vào menu **Settings** (Cài đặt) ở cột bên trái.
+3.  **Sửa Start Command:** Tìm mục **Start Command** và thay thế nội dung cũ bằng lệnh khởi động file Server mới nhất của bạn:
+
+    ```bash
+    uvicorn hsk_server_test:app --host 0.0.0.0 --port $PORT
