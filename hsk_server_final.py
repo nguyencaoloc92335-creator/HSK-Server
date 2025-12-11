@@ -5,7 +5,7 @@ import json
 import random
 import re
 import requests
-import threading
+import logging
 from typing import Dict, Any, List, Optional
 
 # --- CÁC THƯ VIỆN CHÍNH ---
@@ -16,51 +16,56 @@ import psycopg2
 from psycopg2 import pool
 import google.generativeai as genai
 
-# --- 1. CẤU HÌNH HỆ THỐNG (HARDCODE ĐỂ CHẠY NGAY) ---
+# --- 0. CẤU HÌNH LOGGING (ĐỂ DỄ DEBUG) ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Token Facebook (Thay bằng Token thật của bạn nếu cần)
+# --- 1. CẤU HÌNH HỆ THỐNG ---
+
+# Token Facebook (Lưu ý: Giữ bí mật trong môi trường Production)
 PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQKWd5qB15zFMy2KdPm6Ko1rJX6R4ZC3EtnNfvf0gT76V1Qk4l1vflxL1pDVwY8mrgbgAaFFtG6bzcrhJfQ86HdK5v8qZA9zTIge2ZBJcx9oNPOjk1DlQ8juGinZBuah0RDgbCd2vBvlNWr47GVz70BdPNzKRctCGphNJRI0Wm57UwKRmXOZAVfDP7zwZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 
 # Google Gemini API Key
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
 
-# Database URL (Nếu không có sẽ chạy chế độ bộ nhớ tạm - RAM)
+# Database URL
 DATABASE_URL = os.environ.get('DATABASE_URL') 
 
 # Cấu hình AI
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+except Exception as e:
+    logger.error(f"Lỗi cấu hình AI: {e}")
 
 # --- 2. NẠP DỮ LIỆU TỪ VỰNG ---
 try:
     import hsk2_vocabulary_full as hsk_data
     HSK_DATA = hsk_data.HSK_DATA
-    # Tạo map để tra cứu nhanh từ Hán tự
     HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
-    print(f"--> [SYSTEM] Đã nạp thành công {len(HSK_DATA)} từ vựng HSK 2.")
+    logger.info(f"--> [SYSTEM] Đã nạp thành công {len(HSK_DATA)} từ vựng HSK 2.")
 except ImportError:
-    print("--> [ERROR] Không tìm thấy file 'hsk2_vocabulary_full.py'. Hãy đảm bảo file này nằm cùng thư mục.")
-    # Tạo dữ liệu giả để không crash app nếu thiếu file
+    logger.error("--> [ERROR] Không tìm thấy file 'hsk2_vocabulary_full.py'.")
+    # Dữ liệu giả lập để server không bị crash
     HSK_DATA = [{"Hán tự": "你好", "Pinyin": "nǐhǎo", "Nghĩa": "xin chào", "Ví dụ": "你好!", "Ví dụ Pinyin": "Nǐ hǎo!", "Dịch câu": "Chào bạn!"}]
     HSK_MAP = {word["Hán tự"]: word for word in HSK_DATA}
 
-# --- 3. TỐI ƯU KẾT NỐI DATABASE (CONNECTION POOLING) ---
+# --- 3. TỐI ƯU KẾT NỐI DATABASE ---
 db_pool = None
 if DATABASE_URL:
     try:
-        # Tạo hồ chứa 5-20 kết nối sẵn sàng. Nhanh hơn gấp 10 lần so với kết nối đơn lẻ.
-        db_pool = psycopg2.pool.ThreadedConnectionPool(5, 20, DATABASE_URL, sslmode='require')
-        print("--> [DB] Connection Pool đã sẵn sàng.")
+        db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL, sslmode='require')
+        logger.info("--> [DB] Connection Pool đã sẵn sàng.")
     except Exception as e:
-        print(f"--> [DB ERROR] Không thể kết nối DB: {e}. Chuyển sang chế độ RAM.")
+        logger.error(f"--> [DB ERROR] Không thể kết nối DB: {e}. Chuyển sang chế độ RAM.")
 
-# Bộ nhớ đệm (Cache) để truy xuất siêu tốc
+# Cache bộ nhớ (RAM)
 USER_CACHE = {}
 
 app = FastAPI()
 
-# --- 4. CÁC HÀM XỬ LÝ DATABASE & STATE ---
+# --- 4. HÀM QUẢN LÝ TRẠNG THÁI NGƯỜI DÙNG (CỰC KỲ QUAN TRỌNG) ---
 
 def get_db_conn():
     if db_pool:
@@ -72,46 +77,67 @@ def release_db_conn(conn):
         db_pool.putconn(conn)
 
 def get_user_state(user_id: str) -> Dict[str, Any]:
-    """Lấy trạng thái người dùng (Ưu tiên Cache -> DB -> Mặc định)"""
-    # 1. Check Cache (Nhanh nhất)
-    if user_id in USER_CACHE:
-        return USER_CACHE[user_id]
-
-    # Cấu trúc mặc định của một người dùng
+    """
+    Lấy trạng thái người dùng.
+    ĐẢM BẢO: Luôn trả về đầy đủ các trường dữ liệu, không bao giờ thiếu key.
+    """
+    # Trạng thái mặc định chuẩn
     default_state = {
         "user_id": user_id,
-        "mode": "IDLE",            # IDLE (Rảnh), LEARNING (Học), QUIZ (Thi)
-        "session_words": [],       # Danh sách từ đang học
-        "current_index": 0,        # Vị trí hiện tại
-        "quiz_score": 0,           # Điểm số
-        "current_quiz_word": None, # Từ đang hỏi thi
-        "quiz_type": None,         # Loại câu hỏi
+        "mode": "IDLE",            # IDLE, LEARNING, QUIZ
+        "session_words": [],       
+        "current_index": 0,        
+        "quiz_score": 0,           
+        "current_quiz_word": None, 
+        "quiz_type": None,         
         "last_interaction": 0
     }
 
-    # 2. Check DB (Nếu cache không có)
+    # 1. Check Cache
+    if user_id in USER_CACHE:
+        # Merge với default để đảm bảo nếu cache cũ thiếu key thì vẫn có
+        cached_state = USER_CACHE[user_id]
+        if not isinstance(cached_state, dict): cached_state = {}
+        merged = default_state.copy()
+        merged.update(cached_state)
+        return merged
+
+    # 2. Check DB
     if db_pool:
         conn = get_db_conn()
         try:
             with conn.cursor() as cur:
+                # Tạo bảng nếu chưa có
                 cur.execute("CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, state JSONB);")
+                
                 cur.execute("SELECT state FROM users WHERE user_id = %s", (user_id,))
                 res = cur.fetchone()
+                
                 if res:
-                    state = res[0]
-                    USER_CACHE[user_id] = state # Cập nhật lại vào cache
-                    return state
+                    db_data = res[0]
+                    if not isinstance(db_data, dict): db_data = {}
+                    
+                    # --- AUTO FIX DỮ LIỆU ---
+                    # Lấy default làm gốc, đè dữ liệu DB lên
+                    # Những key DB thiếu sẽ lấy từ default
+                    final_state = default_state.copy()
+                    final_state.update(db_data)
+                    
+                    # Lưu lại vào cache
+                    USER_CACHE[user_id] = final_state
+                    return final_state
         except Exception as e:
-            print(f"Lỗi đọc DB: {e}")
+            logger.error(f"Lỗi đọc DB: {e}")
         finally:
             release_db_conn(conn)
     
+    # Nếu không có gì cả, trả về default
     return default_state
 
 def save_user_state(user_id: str, state: Dict[str, Any]):
-    """Lưu trạng thái (Cập nhật Cache ngay lập tức + Lưu DB bất đồng bộ)"""
+    """Lưu trạng thái vào Cache và DB"""
     state["last_interaction"] = int(time.time())
-    USER_CACHE[user_id] = state # Update Cache
+    USER_CACHE[user_id] = state 
     
     if db_pool:
         conn = get_db_conn()
@@ -123,120 +149,131 @@ def save_user_state(user_id: str, state: Dict[str, Any]):
                 """, (user_id, json.dumps(state)))
                 conn.commit()
         except Exception as e:
-            print(f"Lỗi lưu DB: {e}")
+            logger.error(f"Lỗi lưu DB: {e}")
         finally:
             release_db_conn(conn)
 
-# --- 5. TRÍ TUỆ NHÂN TẠO & XỬ LÝ NGÔN NGỮ ---
+def reset_user_state(user_id: str):
+    """Xóa sạch dữ liệu người dùng để sửa lỗi"""
+    if user_id in USER_CACHE:
+        del USER_CACHE[user_id]
+    
+    if db_pool:
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                conn.commit()
+            logger.info(f"Đã reset user {user_id}")
+        except Exception as e:
+            logger.error(f"Lỗi reset DB: {e}")
+        finally:
+            release_db_conn(conn)
+
+# --- 5. LOGIC AI & HELPER ---
 
 def ai_chat_chit(message: str) -> str:
-    """Bot giao tiếp tự nhiên khi người dùng không học"""
     try:
-        # Prompt ngắn gọn, tự nhiên
-        prompt = f"""Bạn là trợ lý học tiếng Trung HSK vui tính. 
-        Người dùng nói: "{message}". 
-        Trả lời ngắn gọn (dưới 20 từ), thân thiện, dùng emoji. 
-        Cuối câu hãy nhắc họ gõ 'Bắt đầu' để học."""
-        
+        prompt = f"Bạn là trợ lý HSK vui tính. Người dùng nói: '{message}'. Trả lời ngắn gọn, thân thiện và nhắc họ gõ 'Bắt đầu' để học."
         response = model.generate_content(prompt)
         return response.text.strip()
     except:
-        return "Chào bạn! Mình là Bot HSK. Gõ 'Bắt đầu' để học ngay nhé! 😄"
+        return "Chào bạn! Gõ 'Bắt đầu' để học tiếng Trung cùng mình nhé! 😄"
 
 def ai_generate_example_smart(word_data: dict) -> dict:
-    """
-    Tạo ví dụ thông minh. 
-    Cơ chế Fallback: Nếu AI lỗi hoặc trả về sai định dạng -> Dùng ngay dữ liệu tĩnh trong sách.
-    """
-    hanzi = word_data['Hán tự']
-    meaning = word_data['Nghĩa']
+    hanzi = word_data.get('Hán tự', '')
+    meaning = word_data.get('Nghĩa', '')
     
-    # Dữ liệu dự phòng (Lấy từ file hsk2_vocabulary_full.py)
-    backup_data = {
-        "han": word_data.get('Ví dụ', 'N/A'),
-        "pinyin": word_data.get('Ví dụ Pinyin', 'N/A'),
-        "viet": word_data.get('Dịch câu', 'N/A')
+    # Backup
+    backup = {
+        "han": word_data.get('Ví dụ', '...'),
+        "pinyin": word_data.get('Ví dụ Pinyin', '...'),
+        "viet": word_data.get('Dịch câu', '...')
     }
 
     try:
         prompt = f"""
-        Tạo 1 ví dụ tiếng Trung HSK2 cực đơn giản cho từ: {hanzi} ({meaning}).
-        Yêu cầu: Chỉ trả về JSON, không giải thích thêm.
-        Format: {{"han": "Câu chữ Hán", "pinyin": "Pinyin có thanh điệu", "viet": "Dịch tiếng Việt"}}
+        Tạo ví dụ HSK2 cho từ: {hanzi} ({meaning}).
+        Chỉ trả về JSON: {{"han": "...", "pinyin": "...", "viet": "..."}}
         """
         response = model.generate_content(prompt)
         text = response.text.strip()
-        
-        # Dùng Regex để trích xuất JSON (đề phòng AI nói nhảm)
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             return json.loads(match.group())
-        else:
-            return backup_data
-    except Exception:
-        # Nếu có bất kỳ lỗi gì (mạng, AI, parse), dùng backup ngay
-        return backup_data
-
-# --- 6. GỬI TIN NHẮN FACEBOOK ---
+        return backup
+    except:
+        return backup
 
 def send_fb_message(user_id: str, text: str):
-    """Gửi tin nhắn qua Graph API"""
     params = {"access_token": PAGE_ACCESS_TOKEN}
     headers = {"Content-Type": "application/json"}
-    data = {
-        "recipient": {"id": user_id},
-        "message": {"text": text}
-    }
+    data = {"recipient": {"id": user_id}, "message": {"text": text}}
     try:
         r = requests.post("https://graph.facebook.com/v16.0/me/messages", params=params, headers=headers, json=data)
         if r.status_code != 200:
-            print(f"FB Error: {r.text}")
+            logger.error(f"FB Error: {r.text}")
     except Exception as e:
-        print(f"Request Error: {e}")
+        logger.error(f"Request Error: {e}")
 
-# --- 7. LOGIC HỌC TẬP (CỐT LÕI) ---
+# --- 6. LOGIC CHÍNH (XỬ LÝ TIN NHẮN) ---
 
 def process_message_background(user_id: str, message_text: str):
-    """Xử lý logic chính (Chạy ngầm để không block Facebook)"""
+    """
+    Hàm xử lý logic chính.
+    Được gọi trong Background Tasks nên không làm chậm request.
+    """
+    # Lấy state an toàn (đã được auto-fix)
     state = get_user_state(user_id)
     msg = message_text.strip().lower()
 
-    # --- NHẬN DIỆN LỆNH HỆ THỐNG ---
+    # --- LỆNH RESET CỨU HỘ ---
+    if msg == "reset":
+        reset_user_state(user_id)
+        send_fb_message(user_id, "🔄 Đã khởi động lại hệ thống cho bạn. Gõ 'Bắt đầu' để học nhé!")
+        return
+
+    # --- ĐIỀU HƯỚNG LỆNH ---
     if any(cmd in msg for cmd in ['bắt đầu', 'bat dau', 'start', 'hoc', 'học đi']):
         start_new_session(user_id, state)
         return
     
-    if any(cmd in msg for cmd in ['thoát', 'dừng', 'stop', 'quit', 'nghỉ']):
+    if any(cmd in msg for cmd in ['thoát', 'dừng', 'stop', 'quit']):
         state["mode"] = "IDLE"
         save_user_state(user_id, state)
-        send_fb_message(user_id, "Đã dừng bài học. Khi nào rảnh quay lại nhé! 👋")
+        send_fb_message(user_id, "Đã dừng học. Bye bye! 👋")
         return
 
-    # --- XỬ LÝ THEO CHẾ ĐỘ (STATE MACHINE) ---
-    
-    # 1. Chế độ Rảnh rỗi
-    if state["mode"] == "IDLE":
-        # Chat vui vẻ với AI
+    # --- XỬ LÝ THEO CHẾ ĐỘ ---
+    # Dùng .get() để tránh crash tuyệt đối
+    mode = state.get("mode", "IDLE")
+
+    if mode == "IDLE":
         reply = ai_chat_chit(message_text)
         send_fb_message(user_id, reply)
 
-    # 2. Chế độ Học từ (Learning)
-    elif state["mode"] == "LEARNING":
-        if any(w in msg for w in ["tiếp", "next", "ok", "tiếp tục", "kế tiếp"]):
+    elif mode == "LEARNING":
+        if any(w in msg for w in ["tiếp", "next", "ok", "tiếp tục"]):
             send_next_word(user_id, state)
         else:
-            send_fb_message(user_id, "💡 Gõ 'Tiếp' để sang từ mới, hoặc 'Dừng' để nghỉ nha.")
+            send_fb_message(user_id, "💡 Gõ 'Tiếp' để sang từ mới nha.")
 
-    # 3. Chế độ Thi (Quiz)
-    elif state["mode"] == "QUIZ":
+    elif mode == "QUIZ":
         check_quiz_answer(user_id, state, message_text)
+    
+    else:
+        # Nếu mode bị lỗi lạ -> Reset về IDLE
+        state["mode"] = "IDLE"
+        save_user_state(user_id, state)
+        send_fb_message(user_id, "Gõ 'Bắt đầu' để học nhé!")
 
 def start_new_session(user_id, state):
-    """Bắt đầu phiên mới: Chọn 5 từ ngẫu nhiên"""
-    # Nếu file từ vựng ít hơn 5 từ thì lấy hết
     sample_size = min(5, len(HSK_DATA))
+    if sample_size == 0:
+        send_fb_message(user_id, "Hệ thống đang bảo trì dữ liệu.")
+        return
+
     session_words = random.sample(HSK_DATA, sample_size)
-    
     state.update({
         "mode": "LEARNING",
         "session_words": session_words,
@@ -244,56 +281,44 @@ def start_new_session(user_id, state):
         "quiz_score": 0
     })
     
-    send_fb_message(user_id, f"🚀 Tuyệt vời! Chúng ta sẽ học {sample_size} từ vựng HSK 2 nhé. Bắt đầu nào!")
-    # Gửi từ đầu tiên luôn
+    send_fb_message(user_id, f"🚀 Bắt đầu học {sample_size} từ vựng HSK 2 nhé!")
     send_learning_card(user_id, session_words[0])
     save_user_state(user_id, state)
 
 def send_learning_card(user_id, word_data):
-    """Gửi thẻ học từ (Có AI hỗ trợ)"""
-    # Lấy ví dụ thông minh (hoặc backup)
     ex = ai_generate_example_smart(word_data)
-    
     content = (
-        f"📖 TỪ MỚI: {word_data['Hán tự']} ({word_data['Pinyin']})\n"
-        f"Nghĩa: {word_data['Nghĩa']}\n"
+        f"📖 TỪ MỚI: {word_data.get('Hán tự', '')} ({word_data.get('Pinyin', '')})\n"
+        f"Nghĩa: {word_data.get('Nghĩa', '')}\n"
         f"----------------\n"
-        f"Ví dụ:\n"
-        f"🇨🇳 {ex['han']}\n"
-        f"🗣️ {ex['pinyin']}\n"
-        f"🇻🇳 {ex['viet']}\n\n"
-        f"👉 Gõ 'Tiếp' để học từ sau."
+        f"Ví dụ:\n🇨🇳 {ex['han']}\n🗣️ {ex['pinyin']}\n🇻🇳 {ex['viet']}\n\n"
+        f"👉 Gõ 'Tiếp' để học tiếp."
     )
     send_fb_message(user_id, content)
 
 def send_next_word(user_id, state):
-    """Chuyển sang từ tiếp theo hoặc qua phần thi"""
     idx = state["current_index"] + 1
     if idx < len(state["session_words"]):
         state["current_index"] = idx
         save_user_state(user_id, state)
         send_learning_card(user_id, state["session_words"][idx])
     else:
-        # Hết từ -> Chuyển sang Quiz
         state["mode"] = "QUIZ"
         state["current_index"] = 0
         state["quiz_score"] = 0
         save_user_state(user_id, state)
-        send_fb_message(user_id, "🎉 Bạn đã học xong! Giờ mình kiểm tra chút nhé. Chuẩn bị...")
+        send_fb_message(user_id, "🎉 Học xong rồi! Giờ làm bài kiểm tra nhé. 3...2...1...")
         time.sleep(1)
         send_quiz_question(user_id, state)
 
 def send_quiz_question(user_id, state):
-    """Gửi câu hỏi trắc nghiệm"""
     if state["current_index"] >= len(state["session_words"]):
-        # Hết câu hỏi -> Tổng kết
         finish_session(user_id, state)
         return
 
     word = state["session_words"][state["current_index"]]
     state["current_quiz_word"] = word
     
-    # Random loại câu hỏi để đỡ chán
     q_type = random.choice(["HANZI_TO_VIET", "VIET_TO_HANZI"])
     state["quiz_type"] = q_type
     
@@ -306,75 +331,60 @@ def send_quiz_question(user_id, state):
     send_fb_message(user_id, q)
 
 def check_quiz_answer(user_id, state, user_ans):
-    """Chấm điểm câu trả lời"""
-    target = state["current_quiz_word"]
+    target = state.get("current_quiz_word", {})
+    if not target: 
+        send_next_word(user_id, state)
+        return
+
     user_ans = user_ans.lower().strip()
     is_correct = False
     
-    # Logic chấm điểm đơn giản nhưng hiệu quả
     if state["quiz_type"] == "HANZI_TO_VIET":
-        # Check xem trong câu trả lời có từ khóa nghĩa đúng không
         keywords = target['Nghĩa'].lower().replace(",", " ").split()
         if any(kw in user_ans for kw in keywords if len(kw) > 1):
             is_correct = True
     else:
-        # Check chữ Hán
         if target['Hán tự'] in user_ans:
             is_correct = True
 
-    # Phản hồi
     if is_correct:
         state["quiz_score"] += 1
-        msg = random.choice(["Chính xác! 🎯", "Giỏi quá! 👏", "Tuyệt vời! 🔥"])
+        msg = "Chính xác! 🎯"
     else:
-        msg = f"Sai rồi 🥲. Đáp án đúng là: {target['Hán tự']} ({target['Nghĩa']})"
+        msg = f"Sai rồi 🥲. Đáp án: {target['Hán tự']} ({target['Nghĩa']})"
     
     send_fb_message(user_id, msg)
     
-    # Câu tiếp theo
     state["current_index"] += 1
     save_user_state(user_id, state)
-    time.sleep(1) # Nghỉ 1 xíu cho tự nhiên
+    time.sleep(1)
     send_quiz_question(user_id, state)
 
 def finish_session(user_id, state):
-    """Tổng kết điểm"""
     score = state["quiz_score"]
     total = len(state["session_words"])
+    msg = f"🏆 KẾT QUẢ: {score}/{total}. "
+    msg += "Xuất sắc! 🌟" if score == total else "Cố gắng thêm nhé! 💪"
+    msg += "\nGõ 'Bắt đầu' để học tiếp."
     
-    if score == total:
-        msg = f"🏆 KẾT QUẢ: {score}/{total}. Xuất sắc! Bạn thuộc hết bài rồi! 🌟"
-    elif score >= total/2:
-        msg = f"📊 KẾT QUẢ: {score}/{total}. Khá lắm, cố gắng thêm nhé! 💪"
-    else:
-        msg = f"📉 KẾT QUẢ: {score}/{total}. Cần ôn luyện thêm nha! 😅"
-        
-    msg += "\nGõ 'Bắt đầu' để học tiếp nhé."
     send_fb_message(user_id, msg)
-    
     state["mode"] = "IDLE"
     save_user_state(user_id, state)
 
-# --- 8. API ROUTE (FASTAPI) ---
+# --- 7. FASTAPI ROUTES ---
 
 @app.get("/")
 def home():
-    """Trang chủ đơn giản để check server"""
-    return PlainTextResponse("HSK Server is running! Webhook endpoint is at /webhook")
+    return PlainTextResponse("HSK Server is RUNNING. Webhook at /webhook")
 
 @app.get("/webhook")
 def verify_webhook(request: Request):
-    """Xác thực Webhook với Facebook"""
     if request.query_params.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(request.query_params.get("hub.challenge"))
     return PlainTextResponse("Error", status_code=403)
 
 @app.post("/webhook")
 async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
-    """
-    Nhận tin nhắn từ Facebook.
-    Quan trọng: Trả về 200 OK ngay lập tức, xử lý logic ở Background.
-    """
     try:
         data = await request.json()
         if 'entry' in data:
@@ -384,13 +394,12 @@ async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
                         sender_id = messaging['sender']['id']
                         text = messaging['message'].get('text', '')
                         if text:
-                            # Đẩy vào hàng đợi xử lý ngầm -> Web mượt mà
                             background_tasks.add_task(process_message_background, sender_id, text)
         return PlainTextResponse("EVENT_RECEIVED")
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Webhook Error: {e}")
         return PlainTextResponse("ERROR", status_code=500)
 
 if __name__ == "__main__":
-    print("--> Server HSK đang khởi động...")
+    logger.info("--> Server starting...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
