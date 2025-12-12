@@ -21,13 +21,13 @@ from gtts import gTTS
 import psycopg2
 from psycopg2 import pool
 
-# Dữ liệu từ vựng (Fallback nếu import lỗi)
+# Dữ liệu từ vựng (Fallback nếu file import bị lỗi)
 try:
     from hsk2_vocabulary_full import HSK_DATA
 except ImportError:
     HSK_DATA = []
 
-# --- CẤU HÌNH (ĐÃ CẬP NHẬT TOKEN MỚI) ---
+# --- CẤU HÌNH (TOKEN MỚI NHẤT) ---
 PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQM5JdL7WYT15Kpz2WUip1Tte40vI75VbtRNm1O1F5mauEtTpzsTvetV9DFjEj4rRsWMUvZB8c2RvwV4FIhX0ky4bjoup8vjJrhyjiUPgUCpR0Gkg1UDxEiorU6C5LORUGwhBrRBIvRL7a8WQmtoafKpaxRkgjeZCfWQZBsqGZBNxEMoUuaFclIqWkwZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
@@ -87,7 +87,7 @@ def init_db():
                     level INT DEFAULT 2
                 );
             """)
-            # Seed data check
+            # Seed data nếu DB trống
             cur.execute("SELECT COUNT(*) FROM words")
             if cur.fetchone()[0] == 0 and HSK_DATA:
                 valid_data = [x for x in HSK_DATA if 'Hán tự' in x]
@@ -136,31 +136,18 @@ def add_word_to_db(hanzi, pinyin, meaning):
     except: return False
     finally: release_db_conn(conn)
 
-def delete_word_from_db(hanzi):
-    conn = get_db_conn()
-    if not conn: return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM words WHERE hanzi = %s", (hanzi,))
-        conn.commit()
-        return True
-    except: return False
-    finally: release_db_conn(conn)
-
-# --- AI LOGIC (ĐƠN GIẢN HÓA VÍ DỤ & PHÂN TÍCH TỪ) ---
+# --- AI LOGIC (TRA TỪ & VÍ DỤ) ---
 
 def ai_generate_example_smart(word_data):
-    """Tạo câu ví dụ siêu đơn giản (HSK 1-2)."""
+    """Tạo câu ví dụ siêu đơn giản."""
     hanzi = word_data.get('Hán tự', '')
     meaning = word_data.get('Nghĩa', '')
     backup = {"han": f"{hanzi}", "pinyin": "...", "viet": f"{meaning}"}
     if not model: return backup
     try:
-        # Prompt yêu cầu câu cực đơn giản
         prompt = f"""
-        Đặt 1 câu tiếng Trung CỰC KỲ ĐƠN GIẢN (trình độ sơ cấp HSK 1, dưới 10 từ) có dùng từ: {hanzi} ({meaning}).
-        Trả về JSON đúng định dạng sau (không markdown):
-        {{"han": "câu chữ hán", "pinyin": "phiên âm pinyin", "viet": "dịch tiếng việt"}}
+        Đặt 1 câu tiếng Trung CỰC KỲ ĐƠN GIẢN (HSK 1, <10 từ) dùng từ: {hanzi} ({meaning}).
+        Trả JSON: {{"han": "...", "pinyin": "...", "viet": "..."}}
         """
         res = model.generate_content(prompt).text.strip()
         match = re.search(r'\{.*\}', res, re.DOTALL)
@@ -168,20 +155,19 @@ def ai_generate_example_smart(word_data):
         return backup
     except: return backup
 
-def ai_analyze_new_word(user_input):
-    """Phân tích input người dùng khi thêm từ."""
+def ai_lookup_word(hanzi_input):
+    """
+    AI đóng vai trò từ điển:
+    User đưa "猫" -> AI trả về Pinyin + Nghĩa.
+    """
     if not model: return None
     try:
         prompt = f"""
-        Phân tích chuỗi văn bản này: "{user_input}".
-        Nhiệm vụ:
-        1. Tìm từ Hán tự (nếu user nhập chữ Hán). Nếu không có, hãy đoán từ Hán dựa trên nghĩa.
-        2. Tìm Nghĩa tiếng Việt.
-        3. Tự động tạo Pinyin chuẩn cho từ Hán đó.
-        
+        User muốn thêm từ Hán tự này vào từ điển: "{hanzi_input}".
+        Hãy cung cấp Pinyin chuẩn và Nghĩa tiếng Việt thông dụng nhất của nó.
         Trả về JSON duy nhất (không markdown):
-        {{"hanzi": "...", "pinyin": "...", "meaning": "..."}}
-        Nếu không xác định được, trả về null.
+        {{"hanzi": "{hanzi_input}", "pinyin": "...", "meaning": "..."}}
+        Nếu input không phải tiếng Trung, trả về null.
         """
         res = model.generate_content(prompt).text.strip()
         res = res.replace('```json', '').replace('```', '')
@@ -191,7 +177,7 @@ def ai_analyze_new_word(user_input):
 def ai_smart_reply(text):
     if not model: return "Gõ 'Menu' để xem hướng dẫn."
     try:
-        return model.generate_content(f"Bạn là bot học tiếng Trung. User nói: '{text}'. Trả lời ngắn gọn, thân thiện bằng tiếng Việt.").text.strip()
+        return model.generate_content(f"Bạn là bot học tiếng Trung. User nói: '{text}'. Trả lời ngắn gọn tiếng Việt.").text.strip()
     except: return "Hệ thống đang bận."
 
 # --- UTILS & MESSAGING ---
@@ -205,13 +191,8 @@ def send_fb(uid, txt):
         r = requests.post("https://graph.facebook.com/v16.0/me/messages", 
             params={"access_token": PAGE_ACCESS_TOKEN},
             json={"recipient": {"id": uid}, "message": {"text": txt}}, timeout=10)
-        
-        # IN LOG LỖI NẾU CÓ
-        if r.status_code != 200:
-            logger.error(f"❌ LỖI FACEBOOK: {r.text}")
-        else:
-            logger.info(f"✅ Đã gửi tin nhắn cho: {uid}")
-            
+        if r.status_code != 200: logger.error(f"❌ FB Error: {r.text}")
+        else: logger.info(f"✅ Sent msg to {uid}")
     except Exception as e: logger.error(f"Send Err: {e}")
 
 def send_audio_fb(user_id, text_content):
@@ -232,15 +213,7 @@ def send_audio_fb(user_id, text_content):
 # --- STATE MANAGER ---
 def get_state(uid):
     if uid in USER_CACHE: return USER_CACHE[uid]
-    s = {
-        "user_id": uid, 
-        "mode": "IDLE", # IDLE, AUTO, QUIZ, ADD_STEP_1, ADD_STEP_2
-        "learned": [], 
-        "session": [], 
-        "next_time": 0, 
-        "waiting": False, 
-        "temp_word": None
-    }
+    s = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False, "temp_word": None}
     if db_pool:
         conn = get_db_conn()
         if conn:
@@ -273,21 +246,15 @@ def save_state(uid, s):
 
 def send_next_auto_word(uid, state):
     if 0 <= datetime.now(timezone(timedelta(hours=7))).hour < 6: return
-    
     if len(state["session"]) >= 6:
-        start_quiz(uid, state)
-        return
+        start_quiz(uid, state); return
 
     learned = state.get("learned", [])
     new_words = get_random_words_from_db(learned, 1)
     
     if not new_words:
-        send_fb(uid, "🎉 Đã học hết kho từ! Reset lại nhé.")
-        state["learned"] = []
-        new_words = get_random_words_from_db([], 1)
-        if not new_words:
-            send_fb(uid, "⚠️ Kho từ trống. Hãy gõ 'Thêm từ' để thêm mới.")
-            return
+        send_fb(uid, "🎉 Đã học hết! Reset hoặc thêm từ mới.")
+        return
     
     word = new_words[0]
     state["session"].append(word)
@@ -297,12 +264,12 @@ def send_next_auto_word(uid, state):
     ex = ai_generate_example_smart(word)
     total = get_total_words_count()
     
-    msg = (f"🔔 **TỪ MỚI** ({len(state['session'])}/6 | Tổng: {len(state['learned'])}/{total})\n\n"
+    msg = (f"🔔 **TỪ MỚI** ({len(state['session'])}/6 | Kho: {total})\n\n"
            f"🇨🇳 **{word['Hán tự']}** ({word['Pinyin']})\n"
            f"🇻🇳 Nghĩa: {word['Nghĩa']}\n"
            f"----------------\n"
            f"Ví dụ: {ex['han']}\n{ex['pinyin']}\n👉 {ex['viet']}\n\n"
-           f"👉 Gõ lại từ **{word['Hán tự']}** để xác nhận.")
+           f"👉 Gõ lại từ **{word['Hán tự']}** để học.")
     send_fb(uid, msg)
     
     threading.Thread(target=send_audio_fb, args=(uid, word['Hán tự'])).start()
@@ -313,81 +280,80 @@ def send_next_auto_word(uid, state):
 
 def start_quiz(uid, state):
     state["mode"] = "QUIZ"
-    send_fb(uid, "🛑 **KIỂM TRA NHANH**\nHãy dịch từ sau sang tiếng Việt:")
-    idx = 0
-    state["quiz_idx"] = idx
-    w = state["session"][idx]
+    send_fb(uid, "🛑 **KIỂM TRA**\nDịch từ này sang tiếng Việt:")
+    state["quiz_idx"] = 0
+    w = state["session"][0]
     send_fb(uid, f"🇨🇳 {w['Hán tự']}")
     save_state(uid, state)
 
-# --- PROCESS MESSAGE ---
+# --- PROCESS MESSAGE (CHỨC NĂNG THÊM TỪ MỚI) ---
 
 def process(uid, text):
     state = get_state(uid)
     msg = text.lower().strip()
     
-    # 1. LOGIC THÊM TỪ MỚI (3 BƯỚC)
-    
-    # BƯỚC 1: Kích hoạt
+    # 1. LOGIC THÊM TỪ (Bước 1: Kích hoạt)
     if msg == "thêm từ":
         state["mode"] = "ADD_STEP_1"
-        send_fb(uid, "📝 **THÊM TỪ MỚI**\nHãy nhập theo mẫu: **[Hán tự] [Nghĩa]**\nVí dụ: 猫 Con mèo")
+        send_fb(uid, "📝 **Thêm từ mới:**\nHãy nhập **Hán tự** bạn muốn thêm (Ví dụ: 猫).")
         save_state(uid, state)
         return
 
-    # BƯỚC 2: Nhận input -> AI phân tích
+    # 2. LOGIC THÊM TỪ (Bước 2: AI Tra cứu & Hỏi xác nhận)
     if state["mode"] == "ADD_STEP_1":
-        if msg == "hủy":
+        # Nếu user muốn hủy
+        if msg in ["hủy", "không", "thôi", "cancel", "dừng"]:
             state["mode"] = "IDLE"
-            send_fb(uid, "Đã hủy thêm từ.")
+            send_fb(uid, "❌ Đã hủy bỏ quá trình thêm từ.")
             save_state(uid, state)
             return
-            
-        send_fb(uid, "⏳ Đang kiểm tra...")
-        analyzed = ai_analyze_new_word(text)
+
+        send_fb(uid, "⏳ Đang tra cứu, đợi chút...")
+        analyzed = ai_lookup_word(text) # AI tìm nghĩa và pinyin
         
-        if analyzed and analyzed.get('hanzi'):
+        if analyzed and analyzed.get('pinyin'):
             state["temp_word"] = analyzed
             state["mode"] = "ADD_STEP_2"
             
             confirm_msg = (
-                f"🧐 **Xác nhận lại:**\n"
-                f"🇨🇳 Hán: {analyzed['hanzi']}\n"
+                f"📖 **Kết quả:**\n"
+                f"🇨🇳 Hán tự: **{analyzed['hanzi']}**\n"
                 f"🔤 Pinyin: {analyzed['pinyin']}\n"
                 f"🇻🇳 Nghĩa: {analyzed['meaning']}\n\n"
-                f"Gõ **OK** để lưu. (Gõ 'Hủy' để bỏ qua)"
+                f"❓ Bạn có muốn thêm từ này không?\n(Gõ **OK** để lưu, gõ **Không** để hủy)"
             )
             send_fb(uid, confirm_msg)
         else:
-            send_fb(uid, "⚠️ AI chưa hiểu. Hãy nhập lại rõ hơn (VD: 猫 Con mèo).")
+            send_fb(uid, "⚠️ AI không nhận diện được từ này. Vui lòng nhập lại hoặc gõ 'Hủy'.")
         
         save_state(uid, state)
         return
 
-    # BƯỚC 3: Lưu vào DB
+    # 3. LOGIC THÊM TỪ (Bước 3: Lưu hoặc Hủy)
     if state["mode"] == "ADD_STEP_2":
-        if msg in ["ok", "có", "yes", "lưu"]:
+        if msg in ["ok", "có", "yes", "lưu", "oke", "uh", "ừ"]:
             data = state.get("temp_word")
             if data:
                 success = add_word_to_db(data['hanzi'], data['pinyin'], data['meaning'])
                 if success:
-                    send_fb(uid, f"✅ Đã thêm **{data['hanzi']}** thành công!")
+                    send_fb(uid, f"✅ Đã thêm **{data['hanzi']}** vào kho!")
                 else:
-                    send_fb(uid, "❌ Từ này đã có trong kho rồi.")
+                    send_fb(uid, "⚠️ Từ này đã tồn tại rồi.")
+            # Xong việc -> Quay về IDLE
             state["mode"] = "IDLE"
             state["temp_word"] = None
         else:
-            send_fb(uid, "❌ Đã hủy.")
+            # Nếu user gõ bất cứ thứ gì không phải đồng ý -> Coi như hủy
+            send_fb(uid, "❌ Đã ngắt bỏ (Hủy thêm từ). Bot hoạt động bình thường.")
             state["mode"] = "IDLE"
             state["temp_word"] = None
             
         save_state(uid, state)
         return
 
-    # 2. CÁC LỆNH KHÁC
+    # 4. CÁC LỆNH KHÁC
     if msg in ["bắt đầu", "start"]:
-        state["mode"] = "AUTO"
-        state["session"] = []
+        state["mode"] = "AUTO"; state["session"] = []
         send_next_auto_word(uid, state)
         return
 
@@ -396,46 +362,40 @@ def process(uid, text):
         save_state(uid, state)
         send_fb(uid, "🔄 Đã reset.")
         return
-    
-    if msg in ["menu", "hướng dẫn"]:
-        send_fb(uid, "📚 MENU:\n- 'Bắt đầu': Học ngay\n- 'Thêm từ': Thêm từ mới\n- 'Reset': Xóa dữ liệu học")
-        return
 
-    # 3. AUTO MODE
+    # 5. AUTO MODE
     if state["mode"] == "AUTO":
         if state["waiting"]:
             target = state.get("current_word_char", "")
             if (target in text) or (msg in ["hiểu", "ok", "tiếp"]):
                 now = get_ts()
-                next_t = now + 540 # 9 mins
-                state["next_time"] = next_t
+                state["next_time"] = now + 540
                 state["waiting"] = False
-                send_fb(uid, f"✅ Đã nhớ. Hẹn {get_vn_time_str(next_t)} ôn tiếp.")
+                send_fb(uid, f"✅ Đã thuộc. Hẹn 9 phút nữa.")
                 save_state(uid, state)
             else:
-                send_fb(uid, f"⚠️ Hãy gõ lại từ **{target}** để nhớ mặt chữ.")
+                send_fb(uid, f"⚠️ Gõ lại từ **{target}** để nhớ nhé.")
         else:
-            if "tiếp" in msg:
-                send_next_auto_word(uid, state)
-            else:
-                send_fb(uid, ai_smart_reply(text))
+            if "tiếp" in msg: send_next_auto_word(uid, state)
+            else: send_fb(uid, ai_smart_reply(text))
 
-    # 4. QUIZ MODE
+    # 6. QUIZ MODE
     elif state["mode"] == "QUIZ":
         idx = state.get("quiz_idx", 0)
         w = state["session"][idx]
         if w['Nghĩa'].lower() in msg:
-            send_fb(uid, "✅ Đúng! (Tạm nghỉ, gõ Bắt đầu để học tiếp)")
+            send_fb(uid, "✅ Đúng! Hết bài. Gõ 'Bắt đầu' để học tiếp.")
             state["mode"] = "IDLE"
             state["session"] = []
         else:
-            send_fb(uid, f"❌ Sai rồi. Đáp án: {w['Nghĩa']}")
+            send_fb(uid, f"❌ Sai. Đáp án: {w['Nghĩa']}")
         save_state(uid, state)
         
     else:
+        # Chat tự do
         send_fb(uid, ai_smart_reply(text))
 
-# --- WEBHOOK & CRON ---
+# --- WEBHOOK & TRIGGER ---
 @app.on_event("startup")
 def startup(): init_db()
 
@@ -476,3 +436,6 @@ def verify(req: Request):
     if req.query_params.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(req.query_params.get("hub.challenge"))
     return PlainTextResponse("Error", 403)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
