@@ -30,7 +30,7 @@ except ImportError:
 # --- CẤU HÌNH (ĐÃ CẬP NHẬT KEY CỦA BẠN) ---
 
 # 1. Facebook Page Access Token
-PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQKWd5qB15zFMy2KdPm6Ko1rJX6R4ZC3EtnNfvf0gT76V1Qk4l1vflxL1pDVwY8mrgbgAaFFtG6bzcrhJfQ86HdK5v8qZA9zTIge2ZBJcx9oNPOjk1DlQ8juGinZBuah0RDgbCd2vBvlNWr47GVz70BdPNzKRctCGphNJRI0Wm57UwKRmXOZAVfDP7zwZDZD"
+PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQFR9N1i6RkU60RRCK6jSjeBvqp5j8iBGxEilLtkVSHr0qdPjVDy8gbyttXqoMJCRfvAFAdZAb328ZBRZBAFyN5qD9b0yzc85tUkKZBCE6k43ZCIYZBlBln970ZBGLZBoZCvYY7iqTzZBXJK7ZCDs1L6hmYhHo8uoKE1VV9ZCYZCNilOSyLkBxL7ZCRZAs9FQpPWzwZDZD"
 
 # 2. Verify Token (Dùng để xác thực Webhook)
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
@@ -580,4 +580,5 @@ def home(): return PlainTextResponse("Server OK")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
