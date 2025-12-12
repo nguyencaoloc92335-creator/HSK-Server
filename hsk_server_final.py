@@ -7,6 +7,7 @@ import threading
 import logging
 import requests
 import psycopg2
+import re
 from psycopg2 import pool
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -59,20 +60,27 @@ def ai_smart_reply(text, context):
         Bạn là trợ lý ảo dạy tiếng Trung HSK.
         Ngữ cảnh: {context}
         User nhắn: "{text}"
-        Nhiệm vụ:
-        1. Hiểu ý định user.
-        2. Trả lời ngắn gọn (dưới 50 từ).
-        3. Hướng dẫn họ dùng lệnh đúng (Ví dụ: 'Bắt đầu', 'Hiểu', 'Tiếp') nếu họ đang lạc đề.
+        Nhiệm vụ: Trả lời ngắn gọn, thân thiện. Nếu user muốn nghỉ ngơi, hãy hướng dẫn họ gõ 'Nghỉ'.
         """
         return model.generate_content(prompt).text.strip()
     except: return "Gõ 'Hướng dẫn' để xem menu nhé."
+
+def ai_generate_simple_sentence(word):
+    if not model: return {"han": word['Ví dụ'], "viet": word['Dịch câu']}
+    try:
+        prompt = f"Tạo 1 câu tiếng Trung cực ngắn (3-6 chữ), dùng từ vựng HSK1 và từ '{word['Hán tự']}'. Trả về JSON: {{\"han\": \"...\", \"viet\": \"...\"}}"
+        res = model.generate_content(prompt).text.strip()
+        match = re.search(r'\{.*\}', res, re.DOTALL)
+        if match: return json.loads(match.group())
+    except: pass
+    return {"han": word['Ví dụ'], "viet": word['Dịch câu']}
 
 def ai_generate_example_smart(word_data: dict) -> dict:
     hanzi = word_data.get('Hán tự', '')
     meaning = word_data.get('Nghĩa', '')
     backup = {"han": word_data.get('Ví dụ', ''), "pinyin": word_data.get('Ví dụ Pinyin', ''), "viet": word_data.get('Dịch câu', '')}
     try:
-        prompt = f"Tạo ví dụ HSK2 đơn giản, ngắn gọn cho từ: {hanzi} ({meaning}). Trả về JSON: {{\"han\": \"...\", \"pinyin\": \"...\", \"viet\": \"...\"}}"
+        prompt = f"Tạo ví dụ HSK2 cho từ: {hanzi} ({meaning}). Trả về JSON: {{\"han\": \"...\", \"pinyin\": \"...\", \"viet\": \"...\"}}"
         res = model.generate_content(prompt).text.strip()
         match = re.search(r'\{.*\}', res, re.DOTALL)
         if match: return json.loads(match.group())
@@ -90,7 +98,7 @@ def draw_progress_bar(current, total, length=8):
     percent = current / total
     filled_length = int(length * percent)
     bar = "▓" * filled_length + "░" * (length - filled_length)
-    return f"{bar}"
+    return f"[{bar}] {int(percent*100)}%"
 
 def send_fb(uid, txt):
     try:
@@ -120,7 +128,8 @@ def get_state(uid):
     if uid in USER_CACHE: return USER_CACHE[uid]
     s = {
         "user_id": uid, 
-        "mode": "IDLE", 
+        "mode": "IDLE", # IDLE, AUTO, QUIZ, REST_SETUP, REST_WAIT
+        "previous_mode": "IDLE", # Lưu chế độ cũ để quay lại sau khi nghỉ
         "learned": [], 
         "session": [], 
         "next_time": 0, 
@@ -132,7 +141,13 @@ def get_state(uid):
             "level": 0,
             "current_question": None
         },
-        "current_word_char": "" 
+        "current_word_char": "",
+        "rest_config": { # Cấu hình nghỉ ngơi
+            "type": None, # 'FIXED' hoặc 'INDEFINITE'
+            "end_time": 0,
+            "last_check": 0,
+            "notified": False
+        }
     }
     if db_pool:
         conn = None
@@ -144,8 +159,9 @@ def get_state(uid):
                 row = cur.fetchone()
                 if row: 
                     db_s = row[0]
+                    # Merge deep structure
                     if "quiz_state" not in db_s: db_s["quiz_state"] = s["quiz_state"]
-                    if "current_word_char" not in db_s: db_s["current_word_char"] = ""
+                    if "rest_config" not in db_s: db_s["rest_config"] = s["rest_config"]
                     s.update(db_s)
         except Exception as e: logger.error(f"DB Read: {e}")
         finally: 
@@ -168,12 +184,11 @@ def save_state(uid, s):
 
 def send_guide_message(user_id):
     guide = (
-        "📚 **HƯỚNG DẪN HỌC TẬP**\n\n"
-        "🔹 **Bắt đầu:** Gõ `Bắt đầu` để nhận từ vựng.\n"
-        "🔹 **Học từ:** Gõ lại chính xác **từ vựng** để xác nhận.\n"
-        "🔹 **Học nhanh:** Gõ `Tiếp` để nhận ngay từ mới.\n"
-        "🔹 **Thi:** Đủ 6 từ sẽ có bài kiểm tra 3 cấp độ (Đúng 100% mới qua).\n"
-        "🔹 **Lệnh khác:** `Chào buổi sáng`, `Học lại`, `Dừng`.\n"
+        "📚 **HƯỚNG DẪN**\n"
+        "🔹 `Bắt đầu`: Học từ đầu.\n"
+        "🔹 `Nghỉ`: Tạm dừng (có thời hạn hoặc không).\n"
+        "🔹 `Tiếp tục`: Quay lại học ngay.\n"
+        "🔹 `Hiểu` / `Tiếp`: Các lệnh học tập.\n"
     )
     send_fb(user_id, guide)
 
@@ -183,7 +198,6 @@ def send_next_auto_word(uid, state):
     current_hour = datetime.now(timezone(timedelta(hours=7))).hour
     if 0 <= current_hour < 6: return
 
-    # Đủ 6 từ -> Vào Quiz
     if len(state["session"]) >= 6:
         start_advanced_quiz(uid, state)
         return
@@ -210,12 +224,10 @@ def send_next_auto_word(uid, state):
            f"🇻🇳 Nghĩa: {word['Nghĩa']}\n"
            f"----------------\n"
            f"Ví dụ: {ex['han']}\n{ex['pinyin']}\n👉 {ex['viet']}\n\n"
-           f"👉 Hãy gõ lại từ **{word['Hán tự']}** để xác nhận và nghe phát âm.")
+           f"👉 Gõ lại từ **{word['Hán tự']}** để xác nhận.")
     send_fb(uid, msg)
     
-    # Gửi audio TỪ VỰNG trước
     threading.Thread(target=send_audio_fb, args=(uid, word['Hán tự'])).start()
-    # Sau đó gửi audio VÍ DỤ
     def send_ex_audio():
         time.sleep(2)
         send_audio_fb(uid, ex['han'])
@@ -230,43 +242,27 @@ def send_next_auto_word(uid, state):
 def send_card(uid, state):
     send_next_auto_word(uid, state)
 
-# --- ADVANCED QUIZ LOGIC (BATCH PROCESSING - 3 LEVELS) ---
+# --- ADVANCED QUIZ LOGIC ---
 
 def start_advanced_quiz(uid, state):
     state["mode"] = "QUIZ"
-    
-    # Khởi tạo Queue cho Level 1 (toàn bộ 6 từ)
     indices = list(range(len(state["session"])))
     random.shuffle(indices)
-    
-    state["quiz_state"] = {
-        "level": 1,
-        "queue": indices, # Danh sách index cần hỏi
-        "failed": [],     # Danh sách index làm sai
-        "current_idx": -1, # Con trỏ hiện tại trong queue
-        "current_question": None
-    }
-    
+    state["quiz_state"] = {"level": 1, "queue": indices, "failed": [], "current_idx": -1, "current_question": None}
     state["waiting"] = False
     state["next_time"] = 0
     save_state(uid, state)
-    
-    send_fb(uid, "🛑 **KIỂM TRA 3 CẤP ĐỘ**\nBạn phải trả lời đúng hết tất cả các từ ở mỗi cấp độ mới được đi tiếp.\n\n🚀 **CẤP ĐỘ 1: NHÌN HÁN TỰ -> ĐOÁN NGHĨA**")
+    send_fb(uid, "🛑 **KIỂM TRA 3 CẤP ĐỘ**\nĐúng 100% mới qua màn.\n🚀 **CẤP 1: NHÌN HÁN -> ĐOÁN NGHĨA**")
     time.sleep(2)
     send_next_batch_question(uid, state)
 
 def send_next_batch_question(uid, state):
     qs = state["quiz_state"]
-    
-    # Tăng con trỏ
     qs["current_idx"] += 1
     
-    # Kiểm tra xem đã hết hàng đợi chưa
     if qs["current_idx"] >= len(qs["queue"]):
-        # Hết vòng. Kiểm tra xem có từ nào sai không
         if len(qs["failed"]) > 0:
-            # Có từ sai -> Ôn lại những từ sai (Cùng Level)
-            send_fb(uid, f"⚠️ Bạn làm sai {len(qs['failed'])} từ. Chúng ta sẽ ôn lại những từ này ngay bây giờ.")
+            send_fb(uid, f"⚠️ Sai {len(qs['failed'])} từ. Ôn lại ngay!")
             qs["queue"] = qs["failed"][:] 
             random.shuffle(qs["queue"])   
             qs["failed"] = []             
@@ -275,27 +271,21 @@ def send_next_batch_question(uid, state):
             time.sleep(1)
             send_next_batch_question_content(uid, state)
         else:
-            # Đúng hết -> Qua Level tiếp theo
             next_level = qs["level"] + 1
-            if next_level > 3: # Đã xong cấp 3 -> Hoàn thành
+            if next_level > 3:
                 finish_session(uid, state)
             else:
                 qs["level"] = next_level
-                qs["queue"] = list(range(len(state["session"]))) # Reset queue full 6 từ
+                qs["queue"] = list(range(len(state["session"]))) 
                 random.shuffle(qs["queue"])
                 qs["failed"] = []
                 qs["current_idx"] = 0
-                
-                level_names = {
-                    2: "CẤP ĐỘ 2: NHÌN NGHĨA -> VIẾT HÁN TỰ",
-                    3: "CẤP ĐỘ 3: NGHE TỪ VỰNG -> VIẾT HÁN TỰ"
-                }
-                send_fb(uid, f"🎉 Xuất sắc! Qua màn.\n\n🚀 **{level_names[next_level]}**")
+                names = {2: "CẤP 2: NGHĨA -> VIẾT HÁN", 3: "CẤP 3: NGHE -> VIẾT HÁN"}
+                send_fb(uid, f"🎉 Xuất sắc! 🚀 **{names[next_level]}**")
                 save_state(uid, state)
                 time.sleep(2)
                 send_next_batch_question_content(uid, state)
     else:
-        # Vẫn còn trong hàng đợi -> Gửi câu hỏi tiếp theo
         send_next_batch_question_content(uid, state)
 
 def send_next_batch_question_content(uid, state):
@@ -303,10 +293,8 @@ def send_next_batch_question_content(uid, state):
     word_idx = qs["queue"][qs["current_idx"]]
     word = state["session"][word_idx]
     level = qs["level"]
-    
-    msg = ""
-    # Tiến độ trong bài thi (Ví dụ: Câu 1/6)
     prog = f"({qs['current_idx'] + 1}/{len(qs['queue'])})"
+    msg = ""
     
     if level == 1:
         msg = f"🔥 {prog} Nghĩa của từ **[{word['Hán tự']}]** là gì?"
@@ -315,9 +303,8 @@ def send_next_batch_question_content(uid, state):
         msg = f"🔥 {prog} Viết chữ Hán cho từ **'{word['Nghĩa']}'**:"
         qs["current_question"] = {"type": "VIET_HAN", "answer": word["Hán tự"]}
     elif level == 3:
-        msg = f"🔥 {prog} Nghe và gõ lại từ vựng (Audio đang gửi...):"
+        msg = f"🔥 {prog} Nghe và gõ lại từ vựng (Audio...):"
         qs["current_question"] = {"type": "LISTEN_WRITE", "answer": word["Hán tự"]}
-        # Gửi audio chỉ đọc từ vựng
         threading.Thread(target=send_audio_fb, args=(uid, word['Hán tự'])).start()
 
     send_fb(uid, msg)
@@ -330,91 +317,177 @@ def check_quiz_answer(uid, state, user_ans):
 
     is_correct = False
     correct_ans = target["answer"]
-    
-    user_clean = user_ans.lower().strip().replace("?", "").replace(".", "").replace("!", "")
-    ans_clean = correct_ans.lower().strip().replace("?", "").replace(".", "").replace("!", "")
+    user_clean = user_ans.lower().strip().replace("?", "").replace(".", "")
+    ans_clean = correct_ans.lower().strip().replace("?", "").replace(".", "")
 
     if target["type"] == "HAN_VIET":
         keywords = ans_clean.split(",")
         if any(k.strip() in user_clean for k in keywords): is_correct = True
-        
-    elif target["type"] == "VIET_HAN":
-        if ans_clean in user_clean: is_correct = True
-        
-    elif target["type"] == "LISTEN_WRITE":
+    elif target["type"] in ["VIET_HAN", "LISTEN_WRITE"]:
         if ans_clean in user_clean: is_correct = True
 
     if is_correct:
         send_fb(uid, "✅ Chính xác!")
+        if qs["level"] < 4: qs["level"] += 1
+        else:
+            qs["level"] = 1
+            qs["word_idx"] += 1
+            done_s = qs["word_idx"]
+            total_s = len(state["session"])
+            send_fb(uid, f"📈 Tiến độ: {draw_progress_bar(done_s, total_s)}")
+            time.sleep(1)
+        save_state(uid, state)
+        time.sleep(1)
+        send_next_batch_question(uid, state)
     else:
-        # SAI -> BÁO SAI VÀ GHI NHẬN ĐỂ THI LẠI
         word_idx = qs["queue"][qs["current_idx"]]
-        
-        # Thêm vào danh sách failed nếu chưa có
-        if word_idx not in qs["failed"]:
-            qs["failed"].append(word_idx)
-            
-        send_fb(uid, f"❌ Sai rồi. Đáp án đúng là: {correct_ans}\n(Bot sẽ hỏi lại từ này cuối đợt).")
-
-    # Dù đúng hay sai cũng chuyển sang câu tiếp theo trong hàng đợi
-    save_state(uid, state)
-    time.sleep(1)
-    send_next_batch_question(uid, state)
+        if word_idx not in qs["failed"]: qs["failed"].append(word_idx)
+        send_fb(uid, f"❌ Sai rồi. Đáp án: {correct_ans}\n(Sẽ hỏi lại sau).")
+        save_state(uid, state)
+        time.sleep(1)
+        send_next_batch_question(uid, state)
 
 def finish_session(uid, state):
-    send_fb(uid, "🏆 XUẤT SẮC! Bạn đã hoàn thành toàn bộ bài kiểm tra.\nĐồng hồ 10 phút bắt đầu đếm từ bây giờ. Nghỉ ngơi nhé!")
-    
+    send_fb(uid, "🏆 XUẤT SẮC! Hoàn thành bài thi.\nNghỉ 10 phút nhé!")
     state["mode"] = "AUTO"
     state["session"] = [] 
-    
     now = get_ts()
-    next_t = now + 540 # 9 phút (bù trừ)
+    next_t = now + 540 
     state["next_time"] = next_t
     state["waiting"] = False 
-    
     time_str = get_vn_time_str(next_t)
-    send_fb(uid, f"⏰ Hẹn gặp lại lúc {time_str}.")
+    send_fb(uid, f"⏰ Hẹn gặp lúc {time_str}.")
     save_state(uid, state)
 
-# --- MESSAGE PROCESSOR ---
+# --- REST MODE LOGIC (MỚI) ---
+
+def parse_time_duration(text):
+    """Phân tích chuỗi thời gian: '15 phút', '1 tiếng', '30p'"""
+    text = text.lower()
+    minutes = 0
+    
+    # Tìm số
+    nums = re.findall(r'\d+', text)
+    if not nums: return 0
+    val = int(nums[0])
+    
+    if any(u in text for u in ['tiếng', 'giờ', 'h']):
+        minutes = val * 60
+    else:
+        minutes = val
+    return minutes * 60 # Trả về giây
 
 def process(uid, text):
     state = get_state(uid)
     msg = text.lower().strip()
     state["last_interaction"] = get_ts()
     
-    # 1. LỆNH CƠ BẢN
+    # --- XỬ LÝ LỆNH NGHỈ ---
+    if msg == "nghỉ" or msg == "nghi" or msg == "dừng":
+        # Lưu chế độ hiện tại để sau này quay lại
+        current_mode = state.get("mode", "IDLE")
+        if current_mode != "REST_SETUP" and current_mode != "REST_WAIT":
+            state["previous_mode"] = current_mode
+        
+        state["mode"] = "REST_SETUP"
+        send_fb(uid, "💤 Bạn muốn nghỉ bao lâu?\n- Gõ số phút/giờ (Ví dụ: '15 phút', '1 tiếng').\n- Hoặc gõ 'Không biết' để nghỉ vô thời hạn (1 tiếng mình sẽ hỏi thăm 1 lần).")
+        save_state(uid, state)
+        return
+
+    # --- XỬ LÝ LỆNH TIẾP TỤC ---
+    if any(w in msg for w in ["tiếp tục", "quay lại", "học tiếp", "sẵn sàng", "ready"]):
+        prev_mode = state.get("previous_mode", "AUTO")
+        if prev_mode == "IDLE": prev_mode = "AUTO"
+        
+        state["mode"] = prev_mode
+        state["rest_config"] = {"type": None} # Xóa cấu hình nghỉ
+        
+        send_fb(uid, "🎉 Mừng bạn quay trở lại! Tiếp tục hành trình nào.")
+        
+        # Logic khôi phục
+        if prev_mode == "AUTO":
+            # Nếu đang chờ confirm -> Nhắc confirm
+            if state["waiting"]:
+                char = state.get("current_word_char", "từ vựng")
+                send_fb(uid, f"👉 Gõ lại từ **{char}** để xác nhận nhé.")
+            # Nếu đang đếm giờ -> Gửi luôn
+            else:
+                send_next_auto_word(uid, state)
+        elif prev_mode == "QUIZ":
+            send_fb(uid, "📝 Tiếp tục bài kiểm tra...")
+            time.sleep(1)
+            # Gửi lại câu hỏi hiện tại
+            if state["quiz_state"]["current_question"]:
+                q_type = state["quiz_state"]["current_question"]["type"]
+                q_text = "Câu hỏi cũ"
+                # (Đơn giản hóa: gửi lại câu hỏi mới của cùng index)
+                send_next_batch_question_content(uid, state)
+        
+        save_state(uid, state)
+        return
+
+    # --- SETUP NGHỈ ---
+    if state["mode"] == "REST_SETUP":
+        # Check xem user muốn nghỉ có thời hạn hay không
+        if any(w in msg for w in ["không", "chưa", "lâu", "tùy", "vô", "unknown"]):
+            # Nghỉ vô thời hạn
+            state["mode"] = "REST_WAIT"
+            state["rest_config"] = {
+                "type": "INDEFINITE",
+                "last_check": get_ts()
+            }
+            send_fb(uid, "😴 Ok, bạn cứ nghỉ ngơi thoải mái. Mỗi 1 tiếng mình sẽ nhắn hỏi thăm nhé.\nKhi nào sẵn sàng gõ 'Tiếp tục'.")
+        else:
+            # Nghỉ có thời hạn
+            duration = parse_time_duration(msg)
+            if duration > 0:
+                end_time = get_ts() + duration
+                state["mode"] = "REST_WAIT"
+                state["rest_config"] = {
+                    "type": "FIXED",
+                    "end_time": end_time,
+                    "notified": False
+                }
+                time_str = get_vn_time_str(end_time)
+                send_fb(uid, f"⏱️ Ok! Mình sẽ đợi đến **{time_str}**.\nNghỉ ngơi vui vẻ nhé!")
+            else:
+                send_fb(uid, "Mình không hiểu thời gian. Vui lòng nhập lại (VD: '10 phút') hoặc gõ 'Tiếp tục' để hủy nghỉ.")
+                return 
+        save_state(uid, state)
+        return
+
+    # --- ĐANG NGHỈ (REST_WAIT) ---
+    if state["mode"] == "REST_WAIT":
+        if any(w in msg for w in ["chưa", "đợi", "wait", "no"]):
+            send_fb(uid, "Ok, cứ thong thả nhé. 1 tiếng sau mình gọi lại.")
+            # Reset timer check
+            state["rest_config"]["last_check"] = get_ts()
+            save_state(uid, state)
+        else:
+            # Nếu user nói gì đó khác (không phải lệnh tiếp tục), AI trả lời xã giao
+            send_fb(uid, "Bot đang chế độ nghỉ. Gõ 'Tiếp tục' để quay lại học nhé.")
+        return
+
+    # --- CÁC MODE CHÍNH ---
+    
     if msg == "reset":
         state = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False}
         save_state(uid, state)
         send_fb(uid, "Đã reset.")
         return
 
-    if any(c in msg for c in ["hướng dẫn", "menu", "help"]):
-        send_guide_message(uid)
-        return
-
-    if any(c in msg for c in ['bắt đầu', 'start', 'chào buổi sáng']):
+    if "bắt đầu" in msg:
         state["mode"] = "AUTO"
         state["session"] = []
         send_fb(uid, "🚀 Bắt đầu!")
         send_card(uid, state)
         return
 
-    if "dừng" in msg or "stop" in msg:
-        state["mode"] = "IDLE"
-        save_state(uid, state)
-        send_fb(uid, "Đã dừng.")
-        return
-
-    # 2. XỬ LÝ THEO CHẾ ĐỘ
     if state["mode"] == "AUTO":
         if state["waiting"]:
-            # YÊU CẦU NHẬP LẠI TỪ
             current_char = state.get("current_word_char", "").strip()
-            is_correct_char = current_char and (current_char in msg or msg in current_char)
-            
-            if is_correct_char or "tiếp" in msg or "ok" in msg:
+            is_correct = current_char and (current_char in msg or msg in current_char)
+            if is_correct or "tiếp" in msg or "ok" in msg:
                 if len(state["session"]) >= 6:
                     start_advanced_quiz(uid, state)
                 else:
@@ -427,28 +500,22 @@ def process(uid, text):
                     send_fb(uid, f"✅ Đã xác nhận! Hẹn {time_str} gửi từ tiếp.")
                     save_state(uid, state)
             else:
-                send_fb(uid, f"⚠️ Vui lòng gõ lại từ **{current_char}** để xác nhận đã học (hoặc gõ 'Tiếp' để bỏ qua).")
+                send_fb(uid, f"⚠️ Gõ lại từ **{current_char}** để xác nhận.")
         else:
             if "tiếp" in msg:
                 send_card(uid, state)
             elif "bao lâu" in msg:
                 rem = state["next_time"] - get_ts()
-                if rem > 0:
-                    send_fb(uid, f"⏳ Còn {rem//60} phút.")
-                else:
-                    send_card(uid, state)
+                send_fb(uid, f"⏳ Còn {rem//60} phút.")
             else:
-                reply = ai_smart_reply(text, "User đang chờ timer đếm ngược.")
-                send_fb(uid, reply)
+                send_fb(uid, ai_smart_reply(text, "Chờ timer."))
 
     elif state["mode"] == "QUIZ":
         check_quiz_answer(uid, state, text)
-        
     else:
-        reply = ai_smart_reply(text, "User đang rảnh. Rủ họ học.")
-        send_fb(uid, reply)
+        send_fb(uid, ai_smart_reply(text, "Idle"))
 
-# --- CRON JOB TRIGGER ---
+# --- TRIGGER SCAN (CRON) ---
 @app.get("/trigger_scan")
 def trigger_scan():
     try:
@@ -465,23 +532,49 @@ def trigger_scan():
                         uid = state["user_id"]
                         USER_CACHE[uid] = state
                         
-                        if state["mode"] == "AUTO" and not state["waiting"] and state["next_time"] > 0:
+                        mode = state.get("mode")
+                        
+                        # 1. Logic AUTO Learning
+                        if mode == "AUTO" and not state["waiting"] and state["next_time"] > 0:
                             if now >= state["next_time"]:
-                                logger.info(f"CRON: Triggering send for {uid}")
+                                logger.info(f"Trigger send {uid}")
                                 send_card(uid, state)
                         
-                        if state["mode"] == "AUTO" and state["waiting"]:
-                            last_act = state.get("last_interaction", 0)
-                            if (now - last_act > 1800) and not state.get("reminder_sent", False):
-                                send_fb(uid, "🔔 Bạn ơi, học xong chưa? Gõ lại từ vựng để tiếp tục nhé!")
+                        # 2. Logic Nhắc nhở khi treo
+                        if mode == "AUTO" and state["waiting"]:
+                            last = state.get("last_interaction", 0)
+                            if (now - last > 1800) and not state.get("reminder_sent", False):
+                                send_fb(uid, "🔔 Học xong chưa? Gõ lại từ vựng nhé!")
                                 state["reminder_sent"] = True
                                 save_state(uid, state)
+                                
+                        # 3. LOGIC REST MODE (MỚI)
+                        if mode == "REST_WAIT":
+                            cfg = state.get("rest_config", {})
+                            rtype = cfg.get("type")
+                            
+                            # Loại 1: Có thời hạn
+                            if rtype == "FIXED":
+                                end_t = cfg.get("end_time", 0)
+                                notified = cfg.get("notified", False)
+                                if now >= end_t and not notified:
+                                    send_fb(uid, "⏰ Hết giờ nghỉ rồi! Bạn đã sẵn sàng chưa?\nGõ 'Tiếp tục' để quay lại guồng quay nào! 💪")
+                                    state["rest_config"]["notified"] = True
+                                    save_state(uid, state)
+                                    
+                            # Loại 2: Vô thời hạn (Nhắc mỗi 1 tiếng)
+                            if rtype == "INDEFINITE":
+                                last_chk = cfg.get("last_check", 0)
+                                if now - last_chk >= 3600: # 1 tiếng
+                                    send_fb(uid, "🔔 Bạn đã nghỉ 1 tiếng rồi. Đã nạp đủ năng lượng chưa?\n- Gõ 'Tiếp tục' để học.\n- Gõ 'Chưa' để nghỉ tiếp.")
+                                    state["rest_config"]["last_check"] = now
+                                    save_state(uid, state)
+
             finally:
                 db_pool.putconn(conn)
-        return PlainTextResponse("SCAN COMPLETED")
+        return PlainTextResponse("SCAN OK")
     except Exception as e:
-        logger.error(f"Scan Error: {e}")
-        return PlainTextResponse(f"ERROR: {e}", status_code=500)
+        return PlainTextResponse(f"ERR: {e}", 500)
 
 # --- WEBHOOK ---
 @app.post("/webhook")
