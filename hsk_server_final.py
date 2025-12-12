@@ -220,9 +220,17 @@ def get_vn_time_str(ts=None):
 
 def send_fb(uid, txt):
     try:
-        requests.post("https://graph.facebook.com/v16.0/me/messages", 
+        r = requests.post("https://graph.facebook.com/v16.0/me/messages", 
             params={"access_token": PAGE_ACCESS_TOKEN},
             json={"recipient": {"id": uid}, "message": {"text": txt}}, timeout=10)
+        
+        # --- ĐOẠN MỚI THÊM ĐỂ CHECK LỖI ---
+        if r.status_code != 200:
+            logger.error(f"❌ LỖI FACEBOOK: {r.text}") # In ra lỗi cụ thể
+        else:
+            logger.info(f"✅ Đã gửi tin nhắn cho: {uid}")
+        # ----------------------------------
+            
     except Exception as e: logger.error(f"Send Err: {e}")
 
 def send_audio_fb(user_id, text_content):
@@ -572,3 +580,4 @@ def home(): return PlainTextResponse("Server OK")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
