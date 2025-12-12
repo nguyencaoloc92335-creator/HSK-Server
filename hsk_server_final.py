@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Thông tin cấu hình
-PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQKIBtbeWZBnA11ENSBgdyv6Tz7hCXDg9U40Wf8HlcDKBGtPGiWFDYCgKMgE2gSsLZBxZAsX25AQeG59ZCfWtZCqxxHrZAqZAHOpQS1DTncVKmVettIzaWTWBQ8UfuybHdbwDasOQ6XAd8QRqgN5WOgkVesBdIXoMw9zJbIEKw9P9XC7ipZB5xRm3eKuMkQZDZD"
+PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQOLS4eBsN7f8vUdGyOsxupjsjl3aJyU6w9udeAVEFRdtLkikidUowCEYxgjiZBvCZBM8ZCISVqrG7crVqMjUCYE0HNixNuQIrdgaPrTJd0w78ZAZC7lEnnyrSTlTZCc0UxZAkYQ0ZCF8hh8A6JskvPmZCNkm5ZBprIAEYQcKAWqXCBakZAOcE7Dli4be4FEeAZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -340,4 +340,5 @@ def home(): return PlainTextResponse("Server OK")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
