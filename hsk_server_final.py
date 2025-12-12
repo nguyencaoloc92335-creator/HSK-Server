@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from starlette.responses import PlainTextResponse
 import uvicorn
 import google.generativeai as genai
+from gtts import gTTS  # <--- THÊM THƯ VIỆN NÀY
 
 # --- CẤU HÌNH ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -57,6 +58,27 @@ def ai_smart_reply(text, context):
         return model.generate_content(prompt).text.strip()
     except: return "Gõ 'Hướng dẫn' để xem menu nhé."
 
+def ai_generate_example_smart(word_data: dict) -> dict:
+    hanzi = word_data.get('Hán tự', '')
+    meaning = word_data.get('Nghĩa', '')
+    backup = {
+        "han": word_data.get('Ví dụ', '...'),
+        "pinyin": word_data.get('Ví dụ Pinyin', '...'),
+        "viet": word_data.get('Dịch câu', '...')
+    }
+    try:
+        prompt = f"""
+        Tạo ví dụ HSK2 cho từ: {hanzi} ({meaning}).
+        Trả về JSON: {{"han": "...", "pinyin": "...", "viet": "..."}}
+        """
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match: return json.loads(match.group())
+        return backup
+    except:
+        return backup
+
 # --- HELPER ---
 def get_ts(): return int(time.time())
 def get_vn_time_str(ts=None):
@@ -70,6 +92,42 @@ def send_fb(uid, txt):
             json={"recipient": {"id": uid}, "message": {"text": txt}},
             timeout=10)
     except Exception as e: logger.error(f"Send Err: {e}")
+
+# --- AUDIO HELPER (MỚI) ---
+def send_audio_fb(user_id, text_content):
+    """Tạo file MP3 từ text và gửi sang Facebook"""
+    if not text_content: return
+    
+    filename = f"voice_{user_id}_{int(time.time())}.mp3"
+    try:
+        # 1. Tạo file audio
+        tts = gTTS(text=text_content, lang='zh-cn')
+        tts.save(filename)
+        
+        # 2. Upload file lên Facebook
+        url = f"https://graph.facebook.com/v16.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+        
+        # Cấu trúc payload gửi file multipart
+        data = {
+            'recipient': json.dumps({'id': user_id}),
+            'message': json.dumps({'attachment': {'type': 'audio', 'payload': {}}})
+        }
+        
+        with open(filename, 'rb') as f:
+            files = {'filedata': (filename, f, 'audio/mp3')}
+            r = requests.post(url, data=data, files=files, timeout=20)
+            
+        if r.status_code != 200:
+            logger.error(f"Audio Send Error: {r.text}")
+        else:
+            logger.info(f"Sent audio to {user_id}")
+            
+    except Exception as e:
+        logger.error(f"TTS Error: {e}")
+    finally:
+        # 3. Dọn dẹp file tạm
+        if os.path.exists(filename):
+            os.remove(filename)
 
 # --- STATE MANAGER ---
 def get_state(uid):
@@ -105,7 +163,7 @@ def save_state(uid, s):
 
 # --- CORE LOGIC ---
 
-def send_card(uid, state):
+def send_next_auto_word(uid, state):
     # Kiểm tra giờ ngủ 0h-6h sáng VN
     current_hour = datetime.now(timezone(timedelta(hours=7))).hour
     if 0 <= current_hour < 6: return
@@ -130,17 +188,29 @@ def send_card(uid, state):
     state["session"].append(word)
     state["learned"].append(word['Hán tự'])
     
+    # Tạo ví dụ mới bằng AI hoặc lấy sẵn
+    ex = ai_generate_example_smart(word)
+    
+    # Gửi tin nhắn TEXT
     msg = (f"🔔 Từ #{len(state['session'])}\n"
            f"🇨🇳 {word['Hán tự']} ({word['Pinyin']})\n"
            f"🇻🇳 {word['Nghĩa']}\n"
            f"----------------\n"
-           f"Ví dụ: {word.get('Ví dụ','')}\n👉 {word.get('Dịch câu','')}\n\n"
-           f"👉 Gõ 'Hiểu' để bắt đầu tính giờ (10p).")
+           f"Ví dụ: {ex['han']}\n{ex['pinyin']}\n👉 {ex['viet']}\n\n"
+           f"👉 Gõ 'Hiểu' để bắt đầu tính giờ.")
     send_fb(uid, msg)
+    
+    # Gửi tin nhắn AUDIO (Chỉ đọc câu ví dụ tiếng Trung)
+    # Chạy trên thread riêng để không chặn flow chính
+    threading.Thread(target=send_audio_fb, args=(uid, ex['han'])).start()
     
     state["waiting"] = True 
     state["next_time"] = 0 
     save_state(uid, state)
+
+def send_card(uid, state):
+    # Wrapper hàm cũ để tương thích
+    send_next_auto_word(uid, state)
 
 def send_quiz(uid, state):
     idx = state.get("q_idx", 0)
@@ -181,11 +251,11 @@ def process(uid, text):
         if state["waiting"]:
             if any(w in msg for w in ["hiểu", "ok", "rồi", "tiếp", "yes"]):
                 now = get_ts()
-                next_t = now + 600 
+                next_t = now + 540 # 9 phút
                 state["next_time"] = next_t
                 state["waiting"] = False
                 time_str = get_vn_time_str(next_t)
-                send_fb(uid, f"✅ Ok! Từ tiếp theo sẽ đến lúc {time_str}.")
+                send_fb(uid, f"✅ Ok! Từ tiếp theo sẽ đến lúc {time_str} (khoảng 9-10p nữa).")
                 save_state(uid, state)
             else:
                 send_fb(uid, ai_smart_reply(text, "Đang chờ user gõ 'Hiểu'"))
@@ -217,18 +287,11 @@ def process(uid, text):
     else:
         send_fb(uid, "Gõ 'Bắt đầu' để học nhé.")
 
-# --- CRON JOB TRIGGER (GIẢI PHÁP DỨT ĐIỂM) ---
+# --- CRON JOB TRIGGER ---
 @app.get("/trigger_scan")
 def trigger_scan():
-    """
-    Endpoint này để dịch vụ bên ngoài (Cron-job.org) gọi vào mỗi 1 phút.
-    Nó sẽ:
-    1. Đánh thức server (nếu đang ngủ).
-    2. Quét xem đã đến giờ gửi tin nhắn chưa.
-    """
     try:
         now = get_ts()
-        # Đọc trực tiếp từ DB để đảm bảo dữ liệu mới nhất nếu server vừa khởi động lại
         if db_pool:
             conn = db_pool.getconn()
             try:
@@ -240,16 +303,14 @@ def trigger_scan():
                     for row in rows:
                         state = row[0]
                         uid = state["user_id"]
-                        USER_CACHE[uid] = state # Cập nhật cache
+                        USER_CACHE[uid] = state
                         
-                        # Logic kiểm tra thời gian
                         if state["mode"] == "AUTO" and not state["waiting"] and state["next_time"] > 0:
                             if now >= state["next_time"]:
                                 logger.info(f"CRON: Triggering send for {uid}")
                                 send_card(uid, state)
             finally:
                 db_pool.putconn(conn)
-        
         return PlainTextResponse("SCAN COMPLETED")
     except Exception as e:
         logger.error(f"Scan Error: {e}")
