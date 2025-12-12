@@ -13,13 +13,13 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from starlette.responses import PlainTextResponse
 import uvicorn
 import google.generativeai as genai
-from gtts import gTTS  # <--- THÊM THƯ VIỆN NÀY
+from gtts import gTTS
 
 # --- CẤU HÌNH ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Thông tin cấu hình
+# Thông tin cấu hình (ĐÃ CẬP NHẬT TOKEN MỚI)
 PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQOLS4eBsN7f8vUdGyOsxupjsjl3aJyU6w9udeAVEFRdtLkikidUowCEYxgjiZBvCZBM8ZCISVqrG7crVqMjUCYE0HNixNuQIrdgaPrTJd0w78ZAZC7lEnnyrSTlTZCc0UxZAkYQ0ZCF8hh8A6JskvPmZCNkm5ZBprIAEYQcKAWqXCBakZAOcE7Dli4be4FEeAZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
@@ -30,6 +30,7 @@ try:
     import hsk2_vocabulary_full as hsk_data
     HSK_DATA = hsk_data.HSK_DATA
 except:
+    # Fallback data nếu file lỗi
     HSK_DATA = [{"Hán tự": "你好", "Pinyin": "nǐhǎo", "Nghĩa": "xin chào", "Ví dụ": "你好", "Ví dụ Pinyin": "nihao", "Dịch câu": "Chào"}]
 
 # --- DATABASE ---
@@ -93,9 +94,12 @@ def send_fb(uid, txt):
             timeout=10)
     except Exception as e: logger.error(f"Send Err: {e}")
 
-# --- AUDIO HELPER (MỚI) ---
+# --- AUDIO HELPER ---
 def send_audio_fb(user_id, text_content):
-    """Tạo file MP3 từ text và gửi sang Facebook"""
+    """
+    Gửi file audio MP3 lên Facebook.
+    Chỉ chạy khi có text, tự dọn dẹp file sau khi gửi.
+    """
     if not text_content: return
     
     filename = f"voice_{user_id}_{int(time.time())}.mp3"
@@ -107,7 +111,6 @@ def send_audio_fb(user_id, text_content):
         # 2. Upload file lên Facebook
         url = f"https://graph.facebook.com/v16.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
         
-        # Cấu trúc payload gửi file multipart
         data = {
             'recipient': json.dumps({'id': user_id}),
             'message': json.dumps({'attachment': {'type': 'audio', 'payload': {}}})
@@ -132,7 +135,16 @@ def send_audio_fb(user_id, text_content):
 # --- STATE MANAGER ---
 def get_state(uid):
     if uid in USER_CACHE: return USER_CACHE[uid]
-    s = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False}
+    s = {
+        "user_id": uid, 
+        "mode": "IDLE", 
+        "learned": [], 
+        "session": [], 
+        "next_time": 0, 
+        "waiting": False,
+        "last_interaction": 0,
+        "reminder_sent": False
+    }
     if db_pool:
         conn = None
         try:
@@ -200,16 +212,16 @@ def send_next_auto_word(uid, state):
            f"👉 Gõ 'Hiểu' để bắt đầu tính giờ.")
     send_fb(uid, msg)
     
-    # Gửi tin nhắn AUDIO (Chỉ đọc câu ví dụ tiếng Trung)
-    # Chạy trên thread riêng để không chặn flow chính
+    # Gửi tin nhắn AUDIO (Chạy trên thread riêng)
     threading.Thread(target=send_audio_fb, args=(uid, ex['han'])).start()
     
     state["waiting"] = True 
     state["next_time"] = 0 
+    state["last_interaction"] = get_ts()
+    state["reminder_sent"] = False
     save_state(uid, state)
 
 def send_card(uid, state):
-    # Wrapper hàm cũ để tương thích
     send_next_auto_word(uid, state)
 
 def send_quiz(uid, state):
@@ -227,6 +239,7 @@ def send_quiz(uid, state):
 def process(uid, text):
     state = get_state(uid)
     msg = text.lower().strip()
+    state["last_interaction"] = get_ts()
     
     if msg == "reset":
         state = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False}
@@ -251,9 +264,11 @@ def process(uid, text):
         if state["waiting"]:
             if any(w in msg for w in ["hiểu", "ok", "rồi", "tiếp", "yes"]):
                 now = get_ts()
-                next_t = now + 540 # 9 phút
+                # 540s = 9 phút (bù trừ độ trễ)
+                next_t = now + 540 
                 state["next_time"] = next_t
                 state["waiting"] = False
+                state["reminder_sent"] = False
                 time_str = get_vn_time_str(next_t)
                 send_fb(uid, f"✅ Ok! Từ tiếp theo sẽ đến lúc {time_str} (khoảng 9-10p nữa).")
                 save_state(uid, state)
@@ -305,10 +320,20 @@ def trigger_scan():
                         uid = state["user_id"]
                         USER_CACHE[uid] = state
                         
+                        # 1. Logic gửi bài tự động
                         if state["mode"] == "AUTO" and not state["waiting"] and state["next_time"] > 0:
                             if now >= state["next_time"]:
                                 logger.info(f"CRON: Triggering send for {uid}")
                                 send_card(uid, state)
+                        
+                        # 2. Logic NHẮC NHỞ (sau 30p không confirm)
+                        if state["mode"] == "AUTO" and state["waiting"]:
+                            last_act = state.get("last_interaction", 0)
+                            if (now - last_act > 1800) and not state.get("reminder_sent", False):
+                                send_fb(uid, "🔔 Bạn ơi, học xong chưa? Gõ 'Hiểu' để tiếp tục nhé! (Hoặc 'Dừng').")
+                                state["reminder_sent"] = True
+                                save_state(uid, state)
+
             finally:
                 db_pool.putconn(conn)
         return PlainTextResponse("SCAN COMPLETED")
@@ -340,5 +365,3 @@ def home(): return PlainTextResponse("Server OK")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
