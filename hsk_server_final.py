@@ -21,14 +21,14 @@ from gtts import gTTS
 import psycopg2
 from psycopg2 import pool
 
-# Dữ liệu từ vựng (Import từ file hsk2_vocabulary_full.py nếu có)
+# Dữ liệu từ vựng (Fallback nếu import lỗi)
 try:
     from hsk2_vocabulary_full import HSK_DATA
 except ImportError:
     HSK_DATA = []
 
-# --- CẤU HÌNH ---
-PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQKWd5qB15zFMy2KdPm6Ko1rJX6R4ZC3EtnNfvf0gT76V1Qk4l1vflxL1pDVwY8mrgbgAaFFtG6bzcrhJfQ86HdK5v8qZA9zTIge2ZBJcx9oNPOjk1DlQ8juGinZBuah0RDgbCd2vBvlNWr47GVz70BdPNzKRctCGphNJRI0Wm57UwKRmXOZAVfDP7zwZDZD"
+# --- CẤU HÌNH (ĐÃ CẬP NHẬT TOKEN MỚI) ---
+PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQM5JdL7WYT15Kpz2WUip1Tte40vI75VbtRNm1O1F5mauEtTpzsTvetV9DFjEj4rRsWMUvZB8c2RvwV4FIhX0ky4bjoup8vjJrhyjiUPgUCpR0Gkg1UDxEiorU6C5LORUGwhBrRBIvRL7a8WQmtoafKpaxRkgjeZCfWQZBsqGZBNxEMoUuaFclIqWkwZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -147,20 +147,18 @@ def delete_word_from_db(hanzi):
     except: return False
     finally: release_db_conn(conn)
 
-# --- AI LOGIC (ĐÃ SỬA) ---
+# --- AI LOGIC (ĐƠN GIẢN HÓA VÍ DỤ & PHÂN TÍCH TỪ) ---
 
 def ai_generate_example_smart(word_data):
-    """
-    Tạo câu ví dụ siêu đơn giản (HSK 1-2).
-    """
+    """Tạo câu ví dụ siêu đơn giản (HSK 1-2)."""
     hanzi = word_data.get('Hán tự', '')
     meaning = word_data.get('Nghĩa', '')
     backup = {"han": f"{hanzi}", "pinyin": "...", "viet": f"{meaning}"}
     if not model: return backup
     try:
-        # Prompt được sửa lại để yêu cầu câu cực đơn giản
+        # Prompt yêu cầu câu cực đơn giản
         prompt = f"""
-        Đặt 1 câu tiếng Trung CỰC KỲ ĐƠN GIẢN (trình độ HSK 1, dưới 10 từ) có dùng từ: {hanzi} ({meaning}).
+        Đặt 1 câu tiếng Trung CỰC KỲ ĐƠN GIẢN (trình độ sơ cấp HSK 1, dưới 10 từ) có dùng từ: {hanzi} ({meaning}).
         Trả về JSON đúng định dạng sau (không markdown):
         {{"han": "câu chữ hán", "pinyin": "phiên âm pinyin", "viet": "dịch tiếng việt"}}
         """
@@ -171,10 +169,7 @@ def ai_generate_example_smart(word_data):
     except: return backup
 
 def ai_analyze_new_word(user_input):
-    """
-    Phân tích input người dùng khi thêm từ:
-    User nhập: "Mèo con mèo" -> AI tách thành Hán:猫, Nghĩa:con mèo, Pinyin:māo
-    """
+    """Phân tích input người dùng khi thêm từ."""
     if not model: return None
     try:
         prompt = f"""
@@ -210,8 +205,13 @@ def send_fb(uid, txt):
         r = requests.post("https://graph.facebook.com/v16.0/me/messages", 
             params={"access_token": PAGE_ACCESS_TOKEN},
             json={"recipient": {"id": uid}, "message": {"text": txt}}, timeout=10)
+        
+        # IN LOG LỖI NẾU CÓ
         if r.status_code != 200:
-            logger.error(f"FB Error: {r.text}")
+            logger.error(f"❌ LỖI FACEBOOK: {r.text}")
+        else:
+            logger.info(f"✅ Đã gửi tin nhắn cho: {uid}")
+            
     except Exception as e: logger.error(f"Send Err: {e}")
 
 def send_audio_fb(user_id, text_content):
@@ -232,7 +232,6 @@ def send_audio_fb(user_id, text_content):
 # --- STATE MANAGER ---
 def get_state(uid):
     if uid in USER_CACHE: return USER_CACHE[uid]
-    # Default State structure
     s = {
         "user_id": uid, 
         "mode": "IDLE", # IDLE, AUTO, QUIZ, ADD_STEP_1, ADD_STEP_2
@@ -240,7 +239,7 @@ def get_state(uid):
         "session": [], 
         "next_time": 0, 
         "waiting": False, 
-        "temp_word": None # Dùng để lưu từ đang thêm dở
+        "temp_word": None
     }
     if db_pool:
         conn = get_db_conn()
@@ -295,7 +294,6 @@ def send_next_auto_word(uid, state):
     state["learned"].append(word['Hán tự'])
     state["current_word_char"] = word['Hán tự']
     
-    # Tạo ví dụ đơn giản
     ex = ai_generate_example_smart(word)
     total = get_total_words_count()
     
@@ -315,17 +313,14 @@ def send_next_auto_word(uid, state):
 
 def start_quiz(uid, state):
     state["mode"] = "QUIZ"
-    # Logic quiz giữ nguyên như cũ, rút gọn code ở đây để tập trung vào logic mới
-    # Bạn có thể paste lại logic quiz 3 cấp độ từ file trước vào đây nếu muốn
-    # Ở đây mình làm bản Quiz đơn giản 1 cấp để demo flow thêm từ.
-    send_fb(uid, "🛑 **KIỂM TRA**\nHãy dịch từ sau sang tiếng Việt:")
+    send_fb(uid, "🛑 **KIỂM TRA NHANH**\nHãy dịch từ sau sang tiếng Việt:")
     idx = 0
     state["quiz_idx"] = idx
     w = state["session"][idx]
     send_fb(uid, f"🇨🇳 {w['Hán tự']}")
     save_state(uid, state)
 
-# --- PROCESS MESSAGE (LOGIC MỚI QUAN TRỌNG) ---
+# --- PROCESS MESSAGE ---
 
 def process(uid, text):
     state = get_state(uid)
@@ -333,14 +328,14 @@ def process(uid, text):
     
     # 1. LOGIC THÊM TỪ MỚI (3 BƯỚC)
     
-    # BƯỚC 1: Kích hoạt chế độ thêm
+    # BƯỚC 1: Kích hoạt
     if msg == "thêm từ":
         state["mode"] = "ADD_STEP_1"
-        send_fb(uid, "📝 **CHẾ ĐỘ THÊM TỪ**\n\nHãy nhập từ vựng theo cấu trúc:\n👉 **[Chữ Hán] [Nghĩa]**\n\nVí dụ: 猫 Con mèo")
+        send_fb(uid, "📝 **THÊM TỪ MỚI**\nHãy nhập theo mẫu: **[Hán tự] [Nghĩa]**\nVí dụ: 猫 Con mèo")
         save_state(uid, state)
         return
 
-    # BƯỚC 2: Nhận input -> AI kiểm tra
+    # BƯỚC 2: Nhận input -> AI phân tích
     if state["mode"] == "ADD_STEP_1":
         if msg == "hủy":
             state["mode"] = "IDLE"
@@ -348,41 +343,41 @@ def process(uid, text):
             save_state(uid, state)
             return
             
-        send_fb(uid, "⏳ Đang phân tích...")
-        analyzed = ai_analyze_new_word(text) # Gọi AI phân tích
+        send_fb(uid, "⏳ Đang kiểm tra...")
+        analyzed = ai_analyze_new_word(text)
         
         if analyzed and analyzed.get('hanzi'):
             state["temp_word"] = analyzed
             state["mode"] = "ADD_STEP_2"
             
             confirm_msg = (
-                f"🧐 **Xác nhận thông tin:**\n"
-                f"🇨🇳 Hán tự: {analyzed['hanzi']}\n"
+                f"🧐 **Xác nhận lại:**\n"
+                f"🇨🇳 Hán: {analyzed['hanzi']}\n"
                 f"🔤 Pinyin: {analyzed['pinyin']}\n"
                 f"🇻🇳 Nghĩa: {analyzed['meaning']}\n\n"
-                f"Bạn có muốn thêm từ này không? (Gõ **OK** để lưu, hoặc **Hủy**)"
+                f"Gõ **OK** để lưu. (Gõ 'Hủy' để bỏ qua)"
             )
             send_fb(uid, confirm_msg)
         else:
-            send_fb(uid, "⚠️ AI không hiểu. Hãy nhập lại: [Chữ Hán] [Nghĩa]\nHoặc gõ 'Hủy'.")
+            send_fb(uid, "⚠️ AI chưa hiểu. Hãy nhập lại rõ hơn (VD: 猫 Con mèo).")
         
         save_state(uid, state)
         return
 
-    # BƯỚC 3: Xác nhận lưu
+    # BƯỚC 3: Lưu vào DB
     if state["mode"] == "ADD_STEP_2":
         if msg in ["ok", "có", "yes", "lưu"]:
             data = state.get("temp_word")
             if data:
                 success = add_word_to_db(data['hanzi'], data['pinyin'], data['meaning'])
                 if success:
-                    send_fb(uid, f"✅ Đã thêm từ **{data['hanzi']}** vào kho!")
+                    send_fb(uid, f"✅ Đã thêm **{data['hanzi']}** thành công!")
                 else:
-                    send_fb(uid, "❌ Lỗi: Từ này có thể đã tồn tại.")
+                    send_fb(uid, "❌ Từ này đã có trong kho rồi.")
             state["mode"] = "IDLE"
             state["temp_word"] = None
         else:
-            send_fb(uid, "❌ Đã hủy bỏ.")
+            send_fb(uid, "❌ Đã hủy.")
             state["mode"] = "IDLE"
             state["temp_word"] = None
             
@@ -403,20 +398,19 @@ def process(uid, text):
         return
     
     if msg in ["menu", "hướng dẫn"]:
-        send_fb(uid, "📚 MENU:\n- Gõ 'Bắt đầu' để học\n- Gõ 'Thêm từ' để nhập từ mới\n- Gõ 'Reset' để xóa dữ liệu học.")
+        send_fb(uid, "📚 MENU:\n- 'Bắt đầu': Học ngay\n- 'Thêm từ': Thêm từ mới\n- 'Reset': Xóa dữ liệu học")
         return
 
-    # 3. LOGIC HỌC TỪ (AUTO)
+    # 3. AUTO MODE
     if state["mode"] == "AUTO":
         if state["waiting"]:
-            # Check confirm
             target = state.get("current_word_char", "")
             if (target in text) or (msg in ["hiểu", "ok", "tiếp"]):
                 now = get_ts()
                 next_t = now + 540 # 9 mins
                 state["next_time"] = next_t
                 state["waiting"] = False
-                send_fb(uid, f"✅ OK. Hẹn {get_vn_time_str(next_t)} gửi từ tiếp.")
+                send_fb(uid, f"✅ Đã nhớ. Hẹn {get_vn_time_str(next_t)} ôn tiếp.")
                 save_state(uid, state)
             else:
                 send_fb(uid, f"⚠️ Hãy gõ lại từ **{target}** để nhớ mặt chữ.")
@@ -426,22 +420,19 @@ def process(uid, text):
             else:
                 send_fb(uid, ai_smart_reply(text))
 
-    # 4. LOGIC QUIZ (Demo)
+    # 4. QUIZ MODE
     elif state["mode"] == "QUIZ":
-        # Check quiz answer basic
         idx = state.get("quiz_idx", 0)
         w = state["session"][idx]
         if w['Nghĩa'].lower() in msg:
-            send_fb(uid, "✅ Đúng!")
-            state["mode"] = "AUTO" # Quay về học tiếp hoặc logic quiz phức tạp hơn
+            send_fb(uid, "✅ Đúng! (Tạm nghỉ, gõ Bắt đầu để học tiếp)")
+            state["mode"] = "IDLE"
             state["session"] = []
-            send_fb(uid, "Đã xong đợt này. Nghỉ chút nhé.")
         else:
             send_fb(uid, f"❌ Sai rồi. Đáp án: {w['Nghĩa']}")
         save_state(uid, state)
         
     else:
-        # Chat tự do
         send_fb(uid, ai_smart_reply(text))
 
 # --- WEBHOOK & CRON ---
