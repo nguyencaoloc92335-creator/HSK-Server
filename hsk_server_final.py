@@ -21,13 +21,13 @@ from gtts import gTTS
 import psycopg2
 from psycopg2 import pool
 
-# Dữ liệu từ vựng (Fallback nếu file import bị lỗi)
+# Dữ liệu từ vựng (Fallback)
 try:
     from hsk2_vocabulary_full import HSK_DATA
 except ImportError:
     HSK_DATA = []
 
-# --- CẤU HÌNH (TOKEN MỚI NHẤT) ---
+# --- CẤU HÌNH ---
 PAGE_ACCESS_TOKEN = "EAAbQQNNSmSMBQM5JdL7WYT15Kpz2WUip1Tte40vI75VbtRNm1O1F5mauEtTpzsTvetV9DFjEj4rRsWMUvZB8c2RvwV4FIhX0ky4bjoup8vjJrhyjiUPgUCpR0Gkg1UDxEiorU6C5LORUGwhBrRBIvRL7a8WQmtoafKpaxRkgjeZCfWQZBsqGZBNxEMoUuaFclIqWkwZDZD"
 VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
@@ -87,7 +87,6 @@ def init_db():
                     level INT DEFAULT 2
                 );
             """)
-            # Seed data nếu DB trống
             cur.execute("SELECT COUNT(*) FROM words")
             if cur.fetchone()[0] == 0 and HSK_DATA:
                 valid_data = [x for x in HSK_DATA if 'Hán tự' in x]
@@ -136,10 +135,8 @@ def add_word_to_db(hanzi, pinyin, meaning):
     except: return False
     finally: release_db_conn(conn)
 
-# --- AI LOGIC (TRA TỪ & VÍ DỤ) ---
-
+# --- AI LOGIC ---
 def ai_generate_example_smart(word_data):
-    """Tạo câu ví dụ siêu đơn giản."""
     hanzi = word_data.get('Hán tự', '')
     meaning = word_data.get('Nghĩa', '')
     backup = {"han": f"{hanzi}", "pinyin": "...", "viet": f"{meaning}"}
@@ -156,18 +153,13 @@ def ai_generate_example_smart(word_data):
     except: return backup
 
 def ai_lookup_word(hanzi_input):
-    """
-    AI đóng vai trò từ điển:
-    User đưa "猫" -> AI trả về Pinyin + Nghĩa.
-    """
     if not model: return None
     try:
         prompt = f"""
         User muốn thêm từ Hán tự này vào từ điển: "{hanzi_input}".
-        Hãy cung cấp Pinyin chuẩn và Nghĩa tiếng Việt thông dụng nhất của nó.
-        Trả về JSON duy nhất (không markdown):
-        {{"hanzi": "{hanzi_input}", "pinyin": "...", "meaning": "..."}}
-        Nếu input không phải tiếng Trung, trả về null.
+        Hãy cung cấp Pinyin chuẩn và Nghĩa tiếng Việt thông dụng nhất.
+        Trả về JSON duy nhất: {{"hanzi": "{hanzi_input}", "pinyin": "...", "meaning": "..."}}
+        Nếu không phải tiếng Trung, trả về null.
         """
         res = model.generate_content(prompt).text.strip()
         res = res.replace('```json', '').replace('```', '')
@@ -192,7 +184,6 @@ def send_fb(uid, txt):
             params={"access_token": PAGE_ACCESS_TOKEN},
             json={"recipient": {"id": uid}, "message": {"text": txt}}, timeout=10)
         if r.status_code != 200: logger.error(f"❌ FB Error: {r.text}")
-        else: logger.info(f"✅ Sent msg to {uid}")
     except Exception as e: logger.error(f"Send Err: {e}")
 
 def send_audio_fb(user_id, text_content):
@@ -213,7 +204,7 @@ def send_audio_fb(user_id, text_content):
 # --- STATE MANAGER ---
 def get_state(uid):
     if uid in USER_CACHE: return USER_CACHE[uid]
-    s = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False, "temp_word": None}
+    s = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False, "temp_word": None, "last_greet_date": ""}
     if db_pool:
         conn = get_db_conn()
         if conn:
@@ -243,7 +234,6 @@ def save_state(uid, s):
             finally: release_db_conn(conn)
 
 # --- CORE LOGIC ---
-
 def send_next_auto_word(uid, state):
     if 0 <= datetime.now(timezone(timedelta(hours=7))).hour < 6: return
     if len(state["session"]) >= 6:
@@ -286,114 +276,74 @@ def start_quiz(uid, state):
     send_fb(uid, f"🇨🇳 {w['Hán tự']}")
     save_state(uid, state)
 
-# --- PROCESS MESSAGE (CHỨC NĂNG THÊM TỪ MỚI) ---
-
+# --- PROCESS MESSAGE ---
 def process(uid, text):
+    # 1. LOGIC GIỜ NGỦ (USER NHẮN TIN)
+    current_hour = datetime.now(timezone(timedelta(hours=7))).hour
+    if 0 <= current_hour < 6: 
+        # Nếu user hỏi vào giờ ngủ -> Trả lời 1 câu rồi nghỉ
+        send_fb(uid, "💤 Hệ thống đang nghỉ ngơi (0h-6h). Vui lòng quay lại học từ 6h sáng đến 23h59 nhé!")
+        return 
+
+    # 2. XỬ LÝ BÌNH THƯỜNG KHI NGOÀI GIỜ NGỦ
     state = get_state(uid)
     msg = text.lower().strip()
     
-    # 1. LOGIC THÊM TỪ (Bước 1: Kích hoạt)
+    # -- THÊM TỪ --
     if msg == "thêm từ":
         state["mode"] = "ADD_STEP_1"
-        send_fb(uid, "📝 **Thêm từ mới:**\nHãy nhập **Hán tự** bạn muốn thêm (Ví dụ: 猫).")
-        save_state(uid, state)
-        return
+        send_fb(uid, "📝 **Thêm từ mới:**\nNhập **Hán tự** muốn thêm (VD: 猫):")
+        save_state(uid, state); return
 
-    # 2. LOGIC THÊM TỪ (Bước 2: AI Tra cứu & Hỏi xác nhận)
     if state["mode"] == "ADD_STEP_1":
-        # Nếu user muốn hủy
-        if msg in ["hủy", "không", "thôi", "cancel", "dừng"]:
-            state["mode"] = "IDLE"
-            send_fb(uid, "❌ Đã hủy bỏ quá trình thêm từ.")
-            save_state(uid, state)
-            return
+        if msg in ["hủy", "không", "thôi", "cancel"]:
+            state["mode"] = "IDLE"; send_fb(uid, "❌ Đã hủy."); save_state(uid, state); return
 
-        send_fb(uid, "⏳ Đang tra cứu, đợi chút...")
-        analyzed = ai_lookup_word(text) # AI tìm nghĩa và pinyin
-        
+        send_fb(uid, "⏳ Đang tra cứu...")
+        analyzed = ai_lookup_word(text)
         if analyzed and analyzed.get('pinyin'):
-            state["temp_word"] = analyzed
-            state["mode"] = "ADD_STEP_2"
-            
-            confirm_msg = (
-                f"📖 **Kết quả:**\n"
-                f"🇨🇳 Hán tự: **{analyzed['hanzi']}**\n"
-                f"🔤 Pinyin: {analyzed['pinyin']}\n"
-                f"🇻🇳 Nghĩa: {analyzed['meaning']}\n\n"
-                f"❓ Bạn có muốn thêm từ này không?\n(Gõ **OK** để lưu, gõ **Không** để hủy)"
-            )
-            send_fb(uid, confirm_msg)
+            state["temp_word"] = analyzed; state["mode"] = "ADD_STEP_2"
+            send_fb(uid, f"📖 **Kết quả:**\n🇨🇳 {analyzed['hanzi']}\n🔤 {analyzed['pinyin']}\n🇻🇳 {analyzed['meaning']}\n\n❓ Thêm không? (Gõ **OK** / **Không**)")
         else:
-            send_fb(uid, "⚠️ AI không nhận diện được từ này. Vui lòng nhập lại hoặc gõ 'Hủy'.")
-        
-        save_state(uid, state)
-        return
+            send_fb(uid, "⚠️ AI không hiểu. Nhập lại hoặc 'Hủy'.")
+        save_state(uid, state); return
 
-    # 3. LOGIC THÊM TỪ (Bước 3: Lưu hoặc Hủy)
     if state["mode"] == "ADD_STEP_2":
-        if msg in ["ok", "có", "yes", "lưu", "oke", "uh", "ừ"]:
+        if msg in ["ok", "có", "yes", "lưu", "oke", "ừ"]:
             data = state.get("temp_word")
-            if data:
-                success = add_word_to_db(data['hanzi'], data['pinyin'], data['meaning'])
-                if success:
-                    send_fb(uid, f"✅ Đã thêm **{data['hanzi']}** vào kho!")
-                else:
-                    send_fb(uid, "⚠️ Từ này đã tồn tại rồi.")
-            # Xong việc -> Quay về IDLE
-            state["mode"] = "IDLE"
-            state["temp_word"] = None
-        else:
-            # Nếu user gõ bất cứ thứ gì không phải đồng ý -> Coi như hủy
-            send_fb(uid, "❌ Đã ngắt bỏ (Hủy thêm từ). Bot hoạt động bình thường.")
-            state["mode"] = "IDLE"
-            state["temp_word"] = None
-            
-        save_state(uid, state)
-        return
+            if data and add_word_to_db(data['hanzi'], data['pinyin'], data['meaning']):
+                send_fb(uid, f"✅ Đã thêm **{data['hanzi']}**!")
+            else: send_fb(uid, "⚠️ Lỗi thêm từ.")
+        else: send_fb(uid, "❌ Đã hủy.")
+        state["mode"] = "IDLE"; state["temp_word"] = None; save_state(uid, state); return
 
-    # 4. CÁC LỆNH KHÁC
+    # -- LỆNH KHÁC --
     if msg in ["bắt đầu", "start"]:
-        state["mode"] = "AUTO"; state["session"] = []
-        send_next_auto_word(uid, state)
-        return
+        state["mode"] = "AUTO"; state["session"] = []; send_next_auto_word(uid, state); return
 
     if msg in ["reset", "học lại"]:
         state = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False}
-        save_state(uid, state)
-        send_fb(uid, "🔄 Đã reset.")
-        return
+        save_state(uid, state); send_fb(uid, "🔄 Đã reset."); return
 
-    # 5. AUTO MODE
+    # -- AUTO LEARNING --
     if state["mode"] == "AUTO":
         if state["waiting"]:
             target = state.get("current_word_char", "")
             if (target in text) or (msg in ["hiểu", "ok", "tiếp"]):
-                now = get_ts()
-                state["next_time"] = now + 540
-                state["waiting"] = False
-                send_fb(uid, f"✅ Đã thuộc. Hẹn 9 phút nữa.")
-                save_state(uid, state)
-            else:
-                send_fb(uid, f"⚠️ Gõ lại từ **{target}** để nhớ nhé.")
+                now = get_ts(); state["next_time"] = now + 540; state["waiting"] = False
+                send_fb(uid, f"✅ Đã thuộc. Hẹn 9 phút nữa."); save_state(uid, state)
+            else: send_fb(uid, f"⚠️ Gõ lại từ **{target}** nhé.")
         else:
             if "tiếp" in msg: send_next_auto_word(uid, state)
             else: send_fb(uid, ai_smart_reply(text))
-
-    # 6. QUIZ MODE
+    # -- QUIZ --
     elif state["mode"] == "QUIZ":
-        idx = state.get("quiz_idx", 0)
-        w = state["session"][idx]
+        idx = state.get("quiz_idx", 0); w = state["session"][idx]
         if w['Nghĩa'].lower() in msg:
-            send_fb(uid, "✅ Đúng! Hết bài. Gõ 'Bắt đầu' để học tiếp.")
-            state["mode"] = "IDLE"
-            state["session"] = []
-        else:
-            send_fb(uid, f"❌ Sai. Đáp án: {w['Nghĩa']}")
+            send_fb(uid, "✅ Đúng! Gõ 'Bắt đầu' học tiếp."); state["mode"] = "IDLE"; state["session"] = []
+        else: send_fb(uid, f"❌ Sai. Đáp án: {w['Nghĩa']}")
         save_state(uid, state)
-        
-    else:
-        # Chat tự do
-        send_fb(uid, ai_smart_reply(text))
+    else: send_fb(uid, ai_smart_reply(text))
 
 # --- WEBHOOK & TRIGGER ---
 @app.on_event("startup")
@@ -401,7 +351,15 @@ def startup(): init_db()
 
 @app.get("/trigger_scan")
 def trigger_scan():
-    now = get_ts()
+    now_dt = datetime.now(timezone(timedelta(hours=7)))
+    now_ts = int(now_dt.timestamp())
+    current_hour = now_dt.hour
+    today_str = now_dt.strftime("%Y-%m-%d")
+
+    # 1. LOGIC GIỜ NGỦ (CRONJOB) -> NGẮT HOÀN TOÀN
+    # Cronjob không được phép gửi tin nhắn tự động lúc này
+    if 0 <= current_hour < 6: return PlainTextResponse("SLEEPING MODE")
+
     if db_pool:
         conn = get_db_conn()
         try:
@@ -412,12 +370,23 @@ def trigger_scan():
                     state = row[0]
                     if isinstance(state, str): state = json.loads(state)
                     uid = state["user_id"]
+                    
+                    # 2. CHECK CHÀO BUỔI SÁNG (Chỉ chạy 1 lần/ngày ngay khi ngủ dậy)
+                    last_greet = state.get("last_greet_date", "")
+                    if last_greet != today_str:
+                        logger.info(f"Sending Daily Greeting to {uid}")
+                        send_fb(uid, "☀️ Chào buổi sáng! Quay lại học thôi nào! Gõ 'Bắt đầu' nhé.")
+                        state["last_greet_date"] = today_str
+                        save_state(uid, state)
+                        continue 
+
+                    # 3. CHECK GỬI BÀI HỌC
                     if state["mode"] == "AUTO" and not state["waiting"] and state["next_time"] > 0:
-                        if now >= state["next_time"]:
+                        if now_ts >= state["next_time"]:
                             USER_CACHE[uid] = state
                             send_next_auto_word(uid, state)
         finally: release_db_conn(conn)
-    return PlainTextResponse("OK")
+    return PlainTextResponse("SCAN OK")
 
 @app.post("/webhook")
 async def webhook(req: Request, bg: BackgroundTasks):
@@ -426,15 +395,13 @@ async def webhook(req: Request, bg: BackgroundTasks):
         if 'entry' in d:
             for e in d['entry']:
                 for m in e.get('messaging', []):
-                    if 'message' in m:
-                        bg.add_task(process, m['sender']['id'], m['message'].get('text', ''))
+                    if 'message' in m: bg.add_task(process, m['sender']['id'], m['message'].get('text', ''))
         return PlainTextResponse("EVENT_RECEIVED")
     except: return PlainTextResponse("ERROR")
 
 @app.get("/webhook")
 def verify(req: Request):
-    if req.query_params.get("hub.verify_token") == VERIFY_TOKEN:
-        return PlainTextResponse(req.query_params.get("hub.challenge"))
+    if req.query_params.get("hub.verify_token") == VERIFY_TOKEN: return PlainTextResponse(req.query_params.get("hub.challenge"))
     return PlainTextResponse("Error", 403)
 
 if __name__ == "__main__":
