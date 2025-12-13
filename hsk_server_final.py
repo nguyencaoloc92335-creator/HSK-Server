@@ -33,37 +33,30 @@ VERIFY_TOKEN = "hsk_mat_khau_bi_mat"
 GEMINI_API_KEY = "AIzaSyB5V6sgqSOZO4v5DyuEZs3msgJqUk54HqQ"
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# --- SETUP LOGGING & APP ---
+# --- SETUP ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 app = FastAPI()
 
-# --- SETUP AI ---
 model = None
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
-    except Exception as e:
-        logger.error(f"Gemini Config Error: {e}")
+    except: logger.error("Gemini Error")
 
-# --- SETUP DATABASE ---
 db_pool = None
 if DATABASE_URL:
     try:
         db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
         logger.info("✅ Database connected!")
-    except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
+    except: logger.error("❌ Database connection failed")
 
 USER_CACHE = {}
 
-# --- DATABASE FUNCTIONS ---
-def get_db_conn():
-    if db_pool: return db_pool.getconn()
-    return None
-
-def release_db_conn(conn):
+# --- DB HELPERS ---
+def get_db_conn(): return db_pool.getconn() if db_pool else None
+def release_db_conn(conn): 
     if db_pool and conn: db_pool.putconn(conn)
 
 def init_db():
@@ -71,22 +64,8 @@ def init_db():
     if not conn: return
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id VARCHAR(50) PRIMARY KEY,
-                    state JSONB,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS words (
-                    id SERIAL PRIMARY KEY,
-                    hanzi VARCHAR(50) UNIQUE NOT NULL,
-                    pinyin VARCHAR(100),
-                    meaning TEXT,
-                    level INT DEFAULT 2
-                );
-            """)
+            cur.execute("""CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, state JSONB, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS words (id SERIAL PRIMARY KEY, hanzi VARCHAR(50) UNIQUE NOT NULL, pinyin VARCHAR(100), meaning TEXT, level INT DEFAULT 2);""")
             cur.execute("SELECT COUNT(*) FROM words")
             if cur.fetchone()[0] == 0 and HSK_DATA:
                 valid_data = [x for x in HSK_DATA if 'Hán tự' in x]
@@ -94,310 +73,319 @@ def init_db():
                     args_str = ','.join(cur.mogrify("(%s,%s,%s)", (x['Hán tự'], x['Pinyin'], x['Nghĩa'])).decode('utf-8') for x in valid_data)
                     cur.execute("INSERT INTO words (hanzi, pinyin, meaning) VALUES " + args_str)
         conn.commit()
-    except Exception as e:
-        logger.error(f"Init DB Error: {e}")
-        conn.rollback()
+    except Exception as e: logger.error(f"Init DB Error: {e}"); conn.rollback()
     finally: release_db_conn(conn)
 
-def get_random_words_from_db(exclude_list, count=1):
-    conn = get_db_conn()
+def get_random_words(exclude, count=1):
+    conn = get_db_conn(); 
     if not conn: return []
     try:
         with conn.cursor() as cur:
-            if exclude_list:
-                query = "SELECT hanzi, pinyin, meaning FROM words WHERE hanzi NOT IN %s ORDER BY RANDOM() LIMIT %s"
-                cur.execute(query, (tuple(exclude_list), count))
+            if exclude:
+                cur.execute("SELECT hanzi, pinyin, meaning FROM words WHERE hanzi NOT IN %s ORDER BY RANDOM() LIMIT %s", (tuple(exclude), count))
             else:
-                query = "SELECT hanzi, pinyin, meaning FROM words ORDER BY RANDOM() LIMIT %s"
-                cur.execute(query, (count,))
-            rows = cur.fetchall()
-            return [{"Hán tự": r[0], "Pinyin": r[1], "Nghĩa": r[2]} for r in rows]
+                cur.execute("SELECT hanzi, pinyin, meaning FROM words ORDER BY RANDOM() LIMIT %s", (count,))
+            return [{"Hán tự": r[0], "Pinyin": r[1], "Nghĩa": r[2]} for r in cur.fetchall()]
     except: return []
     finally: release_db_conn(conn)
 
-def get_total_words_count():
-    conn = get_db_conn()
+def get_total_words():
+    conn = get_db_conn(); 
     if not conn: return 0
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM words")
-            return cur.fetchone()[0]
+        with conn.cursor() as cur: cur.execute("SELECT COUNT(*) FROM words"); return cur.fetchone()[0]
     finally: release_db_conn(conn)
 
-def add_word_to_db(hanzi, pinyin, meaning):
-    conn = get_db_conn()
+def add_word_db(hanzi, pinyin, meaning):
+    conn = get_db_conn(); 
     if not conn: return False
     try:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO words (hanzi, pinyin, meaning) VALUES (%s, %s, %s) ON CONFLICT (hanzi) DO NOTHING", (hanzi, pinyin, meaning))
-        conn.commit()
-        return True
+        conn.commit(); return True
     except: return False
     finally: release_db_conn(conn)
 
-# --- AI LOGIC ---
-def ai_generate_example_smart(word_data):
-    hanzi = word_data.get('Hán tự', '')
-    meaning = word_data.get('Nghĩa', '')
+# --- AI & LOGIC ---
+def ai_simple_example(word):
+    hanzi, meaning = word.get('Hán tự',''), word.get('Nghĩa','')
     backup = {"han": f"{hanzi}", "pinyin": "...", "viet": f"{meaning}"}
     if not model: return backup
     try:
-        prompt = f"""
-        Đặt 1 câu tiếng Trung CỰC KỲ ĐƠN GIẢN (HSK 1, <10 từ) dùng từ: {hanzi} ({meaning}).
-        Trả JSON: {{"han": "...", "pinyin": "...", "viet": "..."}}
-        """
+        prompt = f"Đặt 1 câu tiếng Trung CỰC KỲ ĐƠN GIẢN (HSK 1, <10 từ) dùng từ: {hanzi} ({meaning}). Trả JSON: {{\"han\": \"...\", \"pinyin\": \"...\", \"viet\": \"...\"}}"
         res = model.generate_content(prompt).text.strip()
         match = re.search(r'\{.*\}', res, re.DOTALL)
-        if match: return json.loads(match.group())
-        return backup
+        return json.loads(match.group()) if match else backup
     except: return backup
 
-def ai_lookup_word(hanzi_input):
+def ai_lookup(text):
     if not model: return None
     try:
-        prompt = f"""
-        User muốn thêm từ Hán tự này vào từ điển: "{hanzi_input}".
-        Hãy cung cấp Pinyin chuẩn và Nghĩa tiếng Việt thông dụng nhất.
-        Trả về JSON duy nhất: {{"hanzi": "{hanzi_input}", "pinyin": "...", "meaning": "..."}}
-        Nếu không phải tiếng Trung, trả về null.
-        """
+        prompt = f"Tra từ điển từ: '{text}'. Trả JSON: {{\"hanzi\": \"{text}\", \"pinyin\": \"...\", \"meaning\": \"...\"}}. Nếu không phải tiếng Trung trả null."
         res = model.generate_content(prompt).text.strip()
         res = res.replace('```json', '').replace('```', '')
         return json.loads(res)
     except: return None
 
-def ai_smart_reply(text):
+def ai_chat(text):
     if not model: return "Gõ 'Menu' để xem hướng dẫn."
-    try:
-        return model.generate_content(f"Bạn là bot học tiếng Trung. User nói: '{text}'. Trả lời ngắn gọn tiếng Việt.").text.strip()
-    except: return "Hệ thống đang bận."
+    try: return model.generate_content(f"Bạn là trợ lý học tiếng Trung. User: '{text}'. Trả lời ngắn gọn tiếng Việt.").text.strip()
+    except: return "Lỗi mạng."
 
-# --- UTILS & MESSAGING ---
+# --- UTILS ---
 def get_ts(): return int(time.time())
-def get_vn_time_str(ts=None):
-    if ts is None: ts = time.time()
-    return datetime.fromtimestamp(ts, timezone(timedelta(hours=7))).strftime("%H:%M")
-
+def get_vn_time(): return datetime.now(timezone(timedelta(hours=7)))
 def send_fb(uid, txt):
     try:
-        r = requests.post("https://graph.facebook.com/v16.0/me/messages", 
-            params={"access_token": PAGE_ACCESS_TOKEN},
-            json={"recipient": {"id": uid}, "message": {"text": txt}}, timeout=10)
-        if r.status_code != 200: logger.error(f"❌ FB Error: {r.text}")
-    except Exception as e: logger.error(f"Send Err: {e}")
+        requests.post("https://graph.facebook.com/v16.0/me/messages", params={"access_token": PAGE_ACCESS_TOKEN}, json={"recipient": {"id": uid}, "message": {"text": txt}}, timeout=10)
+    except: pass
 
-def send_audio_fb(user_id, text_content):
-    if not text_content: return
-    filename = f"voice_{user_id}_{int(time.time())}.mp3"
+def send_audio(uid, txt):
+    if not txt: return
+    fname = f"tts_{uid}_{get_ts()}.mp3"
     try:
-        tts = gTTS(text=text_content, lang='zh-cn')
-        tts.save(filename)
-        url = f"https://graph.facebook.com/v16.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
-        data = {'recipient': json.dumps({'id': user_id}), 'message': json.dumps({'attachment': {'type': 'audio', 'payload': {}}})}
-        with open(filename, 'rb') as f:
-            files = {'filedata': (filename, f, 'audio/mp3')}
-            requests.post(url, data=data, files=files, timeout=20)
-    except Exception as e: logger.error(f"Audio Err: {e}")
-    finally:
-        if os.path.exists(filename): os.remove(filename)
+        gTTS(text=txt, lang='zh-cn').save(fname)
+        requests.post(f"https://graph.facebook.com/v16.0/me/messages?access_token={PAGE_ACCESS_TOKEN}", 
+            data={'recipient': json.dumps({'id': uid}), 'message': json.dumps({'attachment': {'type': 'audio', 'payload': {}}})}, 
+            files={'filedata': (fname, open(fname, 'rb'), 'audio/mp3')}, timeout=20)
+    except: pass
+    finally: 
+        if os.path.exists(fname): os.remove(fname)
 
-# --- STATE MANAGER ---
+# --- STATE ---
 def get_state(uid):
     if uid in USER_CACHE: return USER_CACHE[uid]
-    s = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False, "temp_word": None, "last_greet_date": ""}
-    if db_pool:
-        conn = get_db_conn()
-        if conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT state FROM users WHERE user_id = %s", (uid,))
-                    row = cur.fetchone()
-                    if row: 
-                        db_s = row[0]
-                        if isinstance(db_s, str): db_s = json.loads(db_s)
-                        s.update(db_s)
-            except: pass
-            finally: release_db_conn(conn)
+    s = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False, "temp_word": None, "last_greet": "", 
+         "quiz": {"level": 1, "queue": [], "failed": [], "idx": 0}}
+    conn = get_db_conn()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state FROM users WHERE user_id = %s", (uid,))
+                row = cur.fetchone()
+                if row and row[0]: s.update(json.loads(row[0]) if isinstance(row[0], str) else row[0])
+        finally: release_db_conn(conn)
     USER_CACHE[uid] = s
     return s
 
 def save_state(uid, s):
     USER_CACHE[uid] = s
-    if db_pool:
-        conn = get_db_conn()
-        if conn:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO users (user_id, state) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state", (uid, json.dumps(s)))
-                    conn.commit()
-            except: pass
-            finally: release_db_conn(conn)
+    conn = get_db_conn()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users (user_id, state) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state", (uid, json.dumps(s)))
+            conn.commit()
+        finally: release_db_conn(conn)
 
-# --- CORE LOGIC ---
-def send_next_auto_word(uid, state):
-    if 0 <= datetime.now(timezone(timedelta(hours=7))).hour < 6: return
-    if len(state["session"]) >= 6:
-        start_quiz(uid, state); return
+# --- LEARNING LOGIC ---
+def send_word(uid, state):
+    if 0 <= get_vn_time().hour < 6: return
+    if len(state["session"]) >= 6: start_quiz_level(uid, state, 1); return
 
-    learned = state.get("learned", [])
-    new_words = get_random_words_from_db(learned, 1)
+    w = get_random_words(state.get("learned", []), 1)
+    if not w: send_fb(uid, "🎉 Hết từ vựng! Reset hoặc thêm từ mới."); return
     
-    if not new_words:
-        send_fb(uid, "🎉 Đã học hết! Reset hoặc thêm từ mới.")
-        return
+    word = w[0]
+    state["session"].append(word); state["learned"].append(word['Hán tự'])
+    state["current_word"] = word['Hán tự']
     
-    word = new_words[0]
-    state["session"].append(word)
-    state["learned"].append(word['Hán tự'])
-    state["current_word_char"] = word['Hán tự']
-    
-    ex = ai_generate_example_smart(word)
-    total = get_total_words_count()
+    ex = ai_simple_example(word)
+    total = get_total_words()
     
     msg = (f"🔔 **TỪ MỚI** ({len(state['session'])}/6 | Kho: {total})\n\n"
            f"🇨🇳 **{word['Hán tự']}** ({word['Pinyin']})\n"
-           f"🇻🇳 Nghĩa: {word['Nghĩa']}\n"
+           f"🇻🇳 {word['Nghĩa']}\n"
            f"----------------\n"
-           f"Ví dụ: {ex['han']}\n{ex['pinyin']}\n👉 {ex['viet']}\n\n"
+           f"VD: {ex['han']}\n👉 {ex['viet']}\n\n"
            f"👉 Gõ lại từ **{word['Hán tự']}** để học.")
     send_fb(uid, msg)
+    threading.Thread(target=send_audio, args=(uid, word['Hán tự'])).start()
+    threading.Thread(target=lambda: (time.sleep(2), send_audio(uid, ex['han']))).start()
     
-    threading.Thread(target=send_audio_fb, args=(uid, word['Hán tự'])).start()
-    threading.Thread(target=lambda: (time.sleep(2), send_audio_fb(uid, ex['han']))).start()
-    
-    state["waiting"] = True; state["next_time"] = 0
-    save_state(uid, state)
+    state["waiting"] = True; state["next_time"] = 0; save_state(uid, state)
 
-def start_quiz(uid, state):
+# --- QUIZ 3 LEVELS LOGIC ---
+def start_quiz_level(uid, state, level):
     state["mode"] = "QUIZ"
-    send_fb(uid, "🛑 **KIỂM TRA**\nDịch từ này sang tiếng Việt:")
-    state["quiz_idx"] = 0
-    w = state["session"][0]
-    send_fb(uid, f"🇨🇳 {w['Hán tự']}")
+    # Reset queue nếu là level mới
+    if level == 1: 
+        state["quiz"]["queue"] = list(range(len(state["session"]))) # [0, 1, 2, 3, 4, 5]
+        random.shuffle(state["quiz"]["queue"])
+    elif level > 1:
+        state["quiz"]["queue"] = list(range(len(state["session"]))) # Reset queue cho level sau
+        random.shuffle(state["quiz"]["queue"])
+        
+    state["quiz"]["level"] = level
+    state["quiz"]["idx"] = 0
+    state["quiz"]["failed"] = [] # Reset failed mỗi level mới
+    
+    titles = {1: "CẤP 1: NHÌN HÁN -> ĐOÁN NGHĨA", 2: "CẤP 2: NHÌN NGHĨA -> VIẾT HÁN", 3: "CẤP 3: NGHE -> VIẾT HÁN"}
+    send_fb(uid, f"🛑 **KIỂM TRA {titles[level]}**\n(Phải đúng 6/6 từ mới qua màn)")
+    time.sleep(1)
+    send_quiz_question(uid, state)
+
+def send_quiz_question(uid, state):
+    q = state["quiz"]
+    if q["idx"] >= len(q["queue"]): # Hết câu hỏi
+        if len(q["failed"]) > 0:
+            send_fb(uid, f"⚠️ Sai {len(q['failed'])} từ. Ôn lại ngay!")
+            q["queue"] = q["failed"][:] # Chỉ hỏi lại các câu sai
+            q["failed"] = []
+            q["idx"] = 0
+            random.shuffle(q["queue"])
+            save_state(uid, state)
+            time.sleep(1)
+            send_quiz_question(uid, state)
+        else:
+            # Qua màn
+            if q["level"] < 3:
+                send_fb(uid, f"🎉 Xuất sắc! Lên Cấp {q['level']+1}...")
+                start_quiz_level(uid, state, q["level"] + 1)
+            else:
+                send_fb(uid, "🏆 **CHÚC MỪNG!** Bạn đã hoàn thành 3 cấp độ.\nNghỉ ngơi nhé, 10 phút nữa học tiếp!")
+                state["mode"] = "AUTO"; state["session"] = []
+                state["next_time"] = get_ts() + 600 # 10p nghỉ
+                state["waiting"] = False
+                save_state(uid, state)
+        return
+
+    # Lấy câu hỏi hiện tại
+    w_idx = q["queue"][q["idx"]]
+    word = state["session"][w_idx]
+    lvl = q["level"]
+    
+    if lvl == 1:
+        msg = f"❓ ({q['idx']+1}/{len(q['queue'])}) **{word['Hán tự']}** nghĩa là gì?"
+    elif lvl == 2:
+        msg = f"❓ ({q['idx']+1}/{len(q['queue'])}) Viết chữ Hán cho: **{word['Nghĩa']}**"
+    elif lvl == 3:
+        msg = f"🎧 ({q['idx']+1}/{len(q['queue'])}) Nghe và viết lại từ (Audio đang gửi...)"
+        threading.Thread(target=send_audio, args=(uid, word['Hán tự'])).start()
+
+    send_fb(uid, msg)
     save_state(uid, state)
 
-# --- PROCESS MESSAGE ---
-def process(uid, text):
-    # 1. LOGIC GIỜ NGỦ (USER NHẮN TIN)
-    current_hour = datetime.now(timezone(timedelta(hours=7))).hour
-    if 0 <= current_hour < 6: 
-        # Nếu user hỏi vào giờ ngủ -> Trả lời 1 câu rồi nghỉ
-        send_fb(uid, "💤 Hệ thống đang nghỉ ngơi (0h-6h). Vui lòng quay lại học từ 6h sáng đến 23h59 nhé!")
-        return 
+def check_quiz(uid, state, text):
+    q = state["quiz"]
+    w_idx = q["queue"][q["idx"]]
+    word = state["session"][w_idx]
+    ans = text.lower().strip()
+    
+    correct = False
+    if q["level"] == 1: # Check nghĩa
+        # AI check nghĩa hoặc check string cơ bản
+        if any(x in ans for x in word['Nghĩa'].lower().split(',')) or len(ans) > 2: correct = True # Chấp nhận tương đối
+    elif q["level"] in [2, 3]: # Check Hán tự
+        if word['Hán tự'] in text: correct = True
 
-    # 2. XỬ LÝ BÌNH THƯỜNG KHI NGOÀI GIỜ NGỦ
+    if correct:
+        send_fb(uid, "✅ Đúng!")
+    else:
+        send_fb(uid, f"❌ Sai. Đáp án: {word['Hán tự']} - {word['Nghĩa']}")
+        if w_idx not in q["failed"]: q["failed"].append(w_idx)
+
+    q["idx"] += 1
+    save_state(uid, state)
+    time.sleep(1)
+    send_quiz_question(uid, state)
+
+# --- PROCESS ---
+def process(uid, text):
+    # 1. SLEEP MODE 0H-6H
+    if 0 <= get_vn_time().hour < 6:
+        send_fb(uid, "💤 Hệ thống đang nghỉ (0h-6h). Mai học tiếp nhé!"); return
+
     state = get_state(uid)
     msg = text.lower().strip()
-    
-    # -- THÊM TỪ --
+
+    # 2. ADD WORD (3 Steps)
     if msg == "thêm từ":
-        state["mode"] = "ADD_STEP_1"
-        send_fb(uid, "📝 **Thêm từ mới:**\nNhập **Hán tự** muốn thêm (VD: 猫):")
-        save_state(uid, state); return
-
-    if state["mode"] == "ADD_STEP_1":
-        if msg in ["hủy", "không", "thôi", "cancel"]:
-            state["mode"] = "IDLE"; send_fb(uid, "❌ Đã hủy."); save_state(uid, state); return
-
+        state["mode"] = "ADD_1"; send_fb(uid, "📝 Nhập **Hán tự** muốn thêm:"); save_state(uid, state); return
+    
+    if state["mode"] == "ADD_1":
+        if msg in ["hủy","không"]: state["mode"]="IDLE"; send_fb(uid, "❌ Hủy."); save_state(uid, state); return
         send_fb(uid, "⏳ Đang tra cứu...")
-        analyzed = ai_lookup_word(text)
-        if analyzed and analyzed.get('pinyin'):
-            state["temp_word"] = analyzed; state["mode"] = "ADD_STEP_2"
-            send_fb(uid, f"📖 **Kết quả:**\n🇨🇳 {analyzed['hanzi']}\n🔤 {analyzed['pinyin']}\n🇻🇳 {analyzed['meaning']}\n\n❓ Thêm không? (Gõ **OK** / **Không**)")
-        else:
-            send_fb(uid, "⚠️ AI không hiểu. Nhập lại hoặc 'Hủy'.")
+        data = ai_lookup(text)
+        if data and data.get('pinyin'):
+            state["temp"] = data; state["mode"] = "ADD_2"
+            send_fb(uid, f"📖 {data['hanzi']} - {data['pinyin']}\nNghĩa: {data['meaning']}\n❓ Thêm không? (OK/Không)")
+        else: send_fb(uid, "⚠️ Lỗi. Nhập lại hoặc Hủy.")
         save_state(uid, state); return
 
-    if state["mode"] == "ADD_STEP_2":
-        if msg in ["ok", "có", "yes", "lưu", "oke", "ừ"]:
-            data = state.get("temp_word")
-            if data and add_word_to_db(data['hanzi'], data['pinyin'], data['meaning']):
-                send_fb(uid, f"✅ Đã thêm **{data['hanzi']}**!")
-            else: send_fb(uid, "⚠️ Lỗi thêm từ.")
-        else: send_fb(uid, "❌ Đã hủy.")
-        state["mode"] = "IDLE"; state["temp_word"] = None; save_state(uid, state); return
+    if state["mode"] == "ADD_2":
+        if msg in ["ok","có","lưu"]:
+            d = state["temp"]
+            if add_word_db(d['hanzi'], d['pinyin'], d['meaning']): send_fb(uid, f"✅ Đã thêm {d['hanzi']}")
+            else: send_fb(uid, "⚠️ Từ đã có.")
+        else: send_fb(uid, "❌ Hủy.")
+        state["mode"]="IDLE"; state["temp"]=None; save_state(uid, state); return
 
-    # -- LỆNH KHÁC --
+    # 3. QUIZ MODE
+    if state["mode"] == "QUIZ":
+        check_quiz(uid, state, text); return
+
+    # 4. NORMAL COMMANDS
     if msg in ["bắt đầu", "start"]:
-        state["mode"] = "AUTO"; state["session"] = []; send_next_auto_word(uid, state); return
-
+        state["mode"]="AUTO"; state["session"]=[]; send_word(uid, state); return
+    
     if msg in ["reset", "học lại"]:
-        state = {"user_id": uid, "mode": "IDLE", "learned": [], "session": [], "next_time": 0, "waiting": False}
-        save_state(uid, state); send_fb(uid, "🔄 Đã reset."); return
+        state.update({"mode":"IDLE", "learned":[], "session":[]}); save_state(uid, state); send_fb(uid, "🔄 Reset."); return
 
-    # -- AUTO LEARNING --
+    # 5. LEARNING FLOW
     if state["mode"] == "AUTO":
         if state["waiting"]:
-            target = state.get("current_word_char", "")
-            if (target in text) or (msg in ["hiểu", "ok", "tiếp"]):
-                now = get_ts(); state["next_time"] = now + 540; state["waiting"] = False
-                send_fb(uid, f"✅ Đã thuộc. Hẹn 9 phút nữa."); save_state(uid, state)
-            else: send_fb(uid, f"⚠️ Gõ lại từ **{target}** nhé.")
+            cur = state.get("current_word","")
+            if (cur in text) or (msg in ["hiểu","ok","tiếp"]):
+                state["next_time"] = get_ts() + 540 # 9 mins
+                state["waiting"] = False
+                send_fb(uid, "✅ Đã thuộc. Hẹn 9p nữa."); save_state(uid, state)
+            else: send_fb(uid, f"⚠️ Gõ lại từ **{cur}** nhé.")
         else:
-            if "tiếp" in msg: send_next_auto_word(uid, state)
-            else: send_fb(uid, ai_smart_reply(text))
-    # -- QUIZ --
-    elif state["mode"] == "QUIZ":
-        idx = state.get("quiz_idx", 0); w = state["session"][idx]
-        if w['Nghĩa'].lower() in msg:
-            send_fb(uid, "✅ Đúng! Gõ 'Bắt đầu' học tiếp."); state["mode"] = "IDLE"; state["session"] = []
-        else: send_fb(uid, f"❌ Sai. Đáp án: {w['Nghĩa']}")
-        save_state(uid, state)
-    else: send_fb(uid, ai_smart_reply(text))
+            if "tiếp" in msg: send_word(uid, state)
+            else: send_fb(uid, ai_chat(text))
+    else:
+        send_fb(uid, ai_chat(text))
 
-# --- WEBHOOK & TRIGGER ---
+# --- TRIGGER & SERVER ---
 @app.on_event("startup")
 def startup(): init_db()
 
 @app.get("/trigger_scan")
-def trigger_scan():
-    now_dt = datetime.now(timezone(timedelta(hours=7)))
-    now_ts = int(now_dt.timestamp())
-    current_hour = now_dt.hour
-    today_str = now_dt.strftime("%Y-%m-%d")
-
-    # 1. LOGIC GIỜ NGỦ (CRONJOB) -> NGẮT HOÀN TOÀN
-    # Cronjob không được phép gửi tin nhắn tự động lúc này
-    if 0 <= current_hour < 6: return PlainTextResponse("SLEEPING MODE")
-
+def scan():
+    now = get_vn_time()
+    if 0 <= now.hour < 6: return PlainTextResponse("SLEEP") # Cronjob cũng ngủ
+    
     if db_pool:
         conn = get_db_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT state FROM users")
-                rows = cur.fetchall()
-                for row in rows:
-                    state = row[0]
-                    if isinstance(state, str): state = json.loads(state)
-                    uid = state["user_id"]
+                for row in cur.fetchall():
+                    s = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    uid = s["user_id"]
                     
-                    # 2. CHECK CHÀO BUỔI SÁNG (Chỉ chạy 1 lần/ngày ngay khi ngủ dậy)
-                    last_greet = state.get("last_greet_date", "")
-                    if last_greet != today_str:
-                        logger.info(f"Sending Daily Greeting to {uid}")
-                        send_fb(uid, "☀️ Chào buổi sáng! Quay lại học thôi nào! Gõ 'Bắt đầu' nhé.")
-                        state["last_greet_date"] = today_str
-                        save_state(uid, state)
-                        continue 
+                    # Chào buổi sáng
+                    if s.get("last_greet") != now.strftime("%Y-%m-%d"):
+                        send_fb(uid, "☀️ Chào buổi sáng! Gõ 'Bắt đầu' để học.")
+                        s["last_greet"] = now.strftime("%Y-%m-%d"); save_state(uid, s); continue
 
-                    # 3. CHECK GỬI BÀI HỌC
-                    if state["mode"] == "AUTO" and not state["waiting"] and state["next_time"] > 0:
-                        if now_ts >= state["next_time"]:
-                            USER_CACHE[uid] = state
-                            send_next_auto_word(uid, state)
+                    # Gửi từ mới
+                    if s["mode"]=="AUTO" and not s["waiting"] and s["next_time"]>0 and get_ts()>=s["next_time"]:
+                        USER_CACHE[uid] = s; send_word(uid, s)
         finally: release_db_conn(conn)
-    return PlainTextResponse("SCAN OK")
+    return PlainTextResponse("OK")
 
 @app.post("/webhook")
-async def webhook(req: Request, bg: BackgroundTasks):
+async def wh(req: Request, bg: BackgroundTasks):
     try:
         d = await req.json()
         if 'entry' in d:
             for e in d['entry']:
                 for m in e.get('messaging', []):
                     if 'message' in m: bg.add_task(process, m['sender']['id'], m['message'].get('text', ''))
-        return PlainTextResponse("EVENT_RECEIVED")
-    except: return PlainTextResponse("ERROR")
+    except: pass
+    return PlainTextResponse("OK")
 
 @app.get("/webhook")
 def verify(req: Request):
